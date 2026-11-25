@@ -1,0 +1,11 @@
+{
+  "name": "Recompute Node",
+  "short_name": "Recompute",
+  "description": "Lend this device's spare compute to your classroom's private AI lab. Rethink. Reuse. Recompute.",
+  "start_url": "/join",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0b1220",
+  "theme_color": "#0b1220",
+  "icons": [{ "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

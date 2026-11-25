@@ -1,0 +1,166 @@
+<p align="center">
+  <img src="docs/images/banner.svg" alt="Recompute: Rethink. Reuse. Recompute." width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/mattjunior039/recompute-lab/actions/workflows/ci.yml"><img src="https://github.com/mattjunior039/recompute-lab/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-34d399.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/node-%E2%89%A522.13-38bdf8.svg" alt="Node.js 22.13 or newer">
+  <img src="https://img.shields.io/badge/cloud-none-0b1220.svg" alt="No cloud">
+</p>
+
+**Recompute turns a school's old devices, including Chromebooks past their update date, into a private classroom AI lab.** One old computer runs the Hub. Every other device joins by scanning a QR code: no install, no accounts, no cloud. The devices pool their computing power over the school's own Wi-Fi, so students can sort photos with a neural network, train a shared model without ever uploading a photo, chat with an offline AI tutor, and run science simulations, all on hardware that would otherwise sit in a drawer or end up as e-waste.
+
+<p align="center">
+  <img src="docs/images/swarm-sort-join.gif" alt="The Console while Swarm Sort runs: devices join and the images-per-second chart climbs" width="100%">
+</p>
+
+> Screenshots and the animation come from the real app, captured during a test run with simulated devices (several headless browsers on one computer). They show what the screens look like, not how fast any real device is.
+
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph LAN["School Wi-Fi (local network only)"]
+    Hub["Hub<br/>(an old computer)<br/>scheduler · FedAvg · model cache · SQLite"]
+    Console["Console<br/>(teacher's browser)"]
+    C1["Chromebook<br/>(Node)"]
+    C2["Expired Chromebook<br/>(Reborn mode)"]
+    P1["Phone<br/>(Node)"]
+    L1["Old laptop<br/>(Node)"]
+    Console <-->|WSS| Hub
+    C1 <-->|WSS| Hub
+    C2 <-->|WSS| Hub
+    P1 <-->|WSS| Hub
+    L1 <-->|WSS| Hub
+  end
+  HF["Hugging Face<br/>(one-time model download)"] -. "first start only, SHA-256 checked" .-> Hub
+```
+
+- **Hub:** a Node.js/TypeScript server. It hands out small chunks of work, tracks leases so that no work is lost when a device leaves mid-job, double-checks about 5% of chunks on a second device, averages model updates (FedAvg), and serves cached models over the LAN.
+- **Node:** a web page. Devices *pull* work when they're ready (work stealing), so fast and slow devices both help. Chunk sizes adapt to each device.
+- **Console:** the teacher dashboard: a join QR code and room code, a live device grid, the Lab launcher, charts, and impact counters.
+- **Star topology:** every device talks only to the Hub over WebSocket. There's no peer-to-peer, so it works on networks that block device-to-device traffic, as long as devices can reach the Hub.
+
+## The four Labs
+
+| Lab | What students see | What's happening |
+|---|---|---|
+| **Swarm Sort** | Thousands of photos labeled by the class's devices, with a live images-per-second chart and a speedup chart | Image classification with MobileNetV3 (ONNX Runtime Web, WebAssembly, plus WebGPU when available), split across every device |
+| **Teach the Swarm** | Each device photographs objects as *repairable*, *recyclable*, or *battery hazard*; class accuracy rises round by round; the counter reads **"0 photos uploaded"** | Federated learning: each device trains a small classifier on its own photos, and only the weights go to the Hub, which averages them (FedAvg) |
+| **Private Tutor** | A chat tutor that works with the internet unplugged, plus a swarm mode that answers a queue of class questions | SmolLM2-360M-Instruct (or Qwen2.5-0.5B-Instruct) running in the browser via llama.cpp WebAssembly (wllama) |
+| **Science Sweep** | Monte Carlo π and an SIR epidemic parameter sweep filling in live | Thousands of independent simulations spread across devices |
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/console-swarm-sort.png" alt="Swarm Sort finished, with the speedup chart"><br><sub><b>Swarm Sort:</b> results, live chart, and speedup against a solo run</sub></td>
+    <td width="50%"><img src="docs/images/console-teach.png" alt="Teach the Swarm with accuracy per round"><br><sub><b>Teach the Swarm:</b> accuracy per round; photos never leave the devices</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/console-science-sweep.png" alt="Science Sweep results"><br><sub><b>Science Sweep:</b> Monte Carlo π and SIR sweep</sub></td>
+    <td width="50%"><img src="docs/images/console-speedup-experiment.png" alt="Automated 1 to N device speedup experiment"><br><sub><b>Benchmarks:</b> automated 1 → N device speedup experiment, exportable as CSV</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/images/node-phone.png" alt="A phone computing as a node" height="420">
+  &nbsp;&nbsp;
+  <img src="docs/images/node-tutor.png" alt="The offline Private Tutor on a device" height="420">
+</p>
+<p align="center"><sub>Left: a phone computing as a node. Right: the Private Tutor running offline on the device.</sub></p>
+
+## Quickstart (about 5 minutes)
+
+You need one computer to be the Hub (macOS, Windows, or Linux) and devices on the **same Wi-Fi**.
+
+1. **Install [Node.js](https://nodejs.org) LTS** (22.13 or newer).
+2. **Get the code and install it:**
+   ```bash
+   git clone https://github.com/mattjunior039/recompute-lab.git
+   cd recompute-lab
+   npm install
+   ```
+3. **Start the Hub:**
+   ```bash
+   npm run hub
+   ```
+   The first start downloads the AI models once (about 410 MB) and checks their SHA-256 fingerprints. When it prints **"Models ready"**, Recompute works with the internet unplugged.
+4. **Open the Console** on the Hub computer at **http://localhost:8080/console**. It shows a big QR code and a 6-digit room code.
+5. **Join devices** by scanning the QR code. The first time on each device, trust the Hub's certificate (about 2 minutes, see [docs/trust-certificate.md](docs/trust-certificate.md)), or use the basic http address if you're short on time.
+6. Pick a Lab on the Console and press start. To let the Hub computer help too, click **💻 This computer computes too**.
+
+Press **Ctrl+C** in the terminal to stop the Hub. All Hub data (models, certificates, database) lives in the `.recompute/` folder; delete it to start completely fresh.
+
+## Join mode and Reborn mode
+
+| | **Join mode** (default) | **Reborn mode** (`&mode=reborn`) |
+|---|---|---|
+| For | A student's everyday device | Old or expired devices in a charging cart |
+| Screen | Device status, the Labs, and the student's camera and tutor | Full-screen, compute-only status display |
+| How | Scan the Console's QR code | Add `&mode=reborn` to the join link (shown under **Setup**) |
+
+Expired Chromebooks keep working as compute nodes in Reborn mode. For owned, already-expired devices, an optional Linux reflash guide is in [docs/reborn-r2-linux.md](docs/reborn-r2-linux.md). It's never required and comes with clear safety caveats.
+
+## Built-in safety
+
+- Each device uses **all CPU cores but one**, so it stays responsive.
+- Devices **pause when unplugged** where the browser reports charging (Chrome/ChromeOS). Where it can't (Safari), the page says the state is unknown rather than guessing.
+- **Thermal backoff:** if chunks start taking longer, the device slows down.
+- A big **STOP** button on every device, and Stop-all on the Console.
+- **Local-first:** if the Hub disappears, a device that already has the models can keep running a Lab on its own.
+
+## Privacy and security
+
+- **No accounts, no names, no analytics, no telemetry.** Nothing is sent outside your network during lessons.
+- **LAN only:** the Hub serves everything itself. The internet is needed only for `npm install` and the one-time model download.
+- **Photos stay on the device.** Teach the Swarm sends only model weights.
+- **No remote code:** devices run only the compute kernels built into the app. The Hub sends data, never code.
+- **Pinned models:** every model is pinned to a fixed version and checked against a SHA-256 hash.
+- **Local HTTPS:** the Hub creates its own small certificate authority so browsers allow multi-threaded WebAssembly, the camera, offline storage, and WebGPU. The CA's private key never leaves the Hub computer.
+
+Found a vulnerability? See [SECURITY.md](SECURITY.md).
+
+## Honest limitations
+
+- **Throughput, not latency.** Pooling devices finishes a *batch* of work sooner (more photos per second, more questions answered). It doesn't make a single chat reply faster.
+- **Old devices are slow on their own.** The point is what they can do together. A single old Chromebook running the tutor answers slowly.
+- **Only measured numbers.** Recompute shows speeds it actually measured on your devices. This README doesn't claim any device speeds; run the Benchmark page (`/bench`) and the speedup experiment to get your own.
+- **No energy claims.** Recompute never estimates power use. If your school has a plug-in power meter, you can *optionally* enter measured watts per device under **Console → Benchmarks**, and energy per job is then calculated from those readings only.
+- **Same network required.** Devices must be able to reach the Hub. Some school SSIDs isolate clients; see the [IT admin guide](docs/it-admin-guide.md).
+- **iPhones and iPads pause background tabs.** Keep the Recompute page open with the screen on.
+- Recompute is a classroom learning tool, not a production compute cluster.
+
+## Documentation
+
+| Guide | For |
+|---|---|
+| [Teacher guide](docs/teacher-guide.md) | Running a 45-minute Lab, aligned to the AI4K12 Five Big Ideas |
+| [IT admin guide](docs/it-admin-guide.md) | Network, Google Admin console policies, certificates, AUE and Reborn guidance, battery safety |
+| [Trusting the certificate](docs/trust-certificate.md) | Step-by-step for ChromeOS, iOS, macOS, Windows, and Android |
+| [Reborn R2: Linux on expired Chromebooks](docs/reborn-r2-linux.md) | Optional, advanced, with safety caveats |
+| [Licenses](docs/licenses.md) | Third-party models, dataset, and libraries |
+
+## Roadmap
+
+- A "What my device did" panel, so students can see exactly what their device computed
+- Pause automatically while a student is using their device in Join mode
+- An expanded, plain-language privacy panel
+- More Labs and more measured benchmark data from real classroom devices
+- Translations of the Console and the guides
+
+Ideas and classroom feedback are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Contributing
+
+Bug reports, classroom stories, measured benchmark numbers, and pull requests are all welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). To run the tests:
+
+```bash
+npm test
+npm run typecheck
+```
+
+## License and credits
+
+Recompute is released under the [MIT License](LICENSE). Third-party models (MobileNetV3, SmolLM2, Qwen2.5), the Caltech 101 image subset (CC BY 4.0), and libraries keep their own licenses; see [docs/licenses.md](docs/licenses.md).
+
+**AI-assistance disclosure:** Software built with AI coding assistants from the author's design; the idea and research are the author's.

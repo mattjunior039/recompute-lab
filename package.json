@@ -1,0 +1,44 @@
+{
+  "name": "recompute",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Recompute: old school devices pool their compute into a private classroom AI lab. Rethink. Reuse. Recompute.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "hub": "tsx hub/src/main.ts",
+    "build:web": "tsx hub/src/build-web.ts",
+    "test": "node --import tsx --test hub/test/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@wllama/wllama": "^4.0.0",
+    "@wllama/wllama-compat": "^4.0.0",
+    "esbuild": "^0.28.2",
+    "node-forge": "^1.4.4",
+    "onnxruntime-web": "^1.31.1",
+    "protobufjs": "^8.8.1",
+    "qrcode": "^1.5.4",
+    "tsx": "^4.23.15",
+    "ws": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.7",
+    "@types/node-forge": "^1.3.14",
+    "@types/qrcode": "^1.5.6",
+    "@types/ws": "^8.18.2",
+    "playwright": "^1.65.1",
+    "typescript": "^7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mattjunior039/recompute-lab.git"
+  },
+  "homepage": "https://github.com/mattjunior039/recompute-lab#readme",
+  "bugs": {
+    "url": "https://github.com/mattjunior039/recompute-lab/issues"
+  }
+}
