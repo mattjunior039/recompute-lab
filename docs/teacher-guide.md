@@ -65,6 +65,11 @@ This lesson turns a cart of classroom devices, including old or expired ones, in
 - **Disease-spread sweep:** devices each simulate different infection and recovery rates; the heat map shows which combinations cause big outbreaks.
 - Ask: *Which jobs split well across many devices, and which don't?*
 
+### Swap-ins for another lesson
+- **Live Captions + Translate (Perception; Natural Interaction; Societal Impact):** click the **🎙️ Live Captions** card, then **🎤 Start microphone** and talk. Captions appear with a Spanish line underneath, made on the class's devices with no internet. Ask: *How far behind is the caption, and why? Who benefits from captions? What does "0 seconds of audio saved" promise, and how could you check it?*
+- **Swarm Render (Representation & Reasoning):** the class draws one 8K picture together, tile by tile, each tile outlined in its device's color. Run **1 device vs all** and compare the times. Then show it on the **Wall** tab across the students' screens.
+- **Use cases (Societal Impact):** open the **Use cases** tab and pick one card (library, shelter, office, art class, science class, home). Ask: *Who else has old devices and a problem these Labs could help with? What would you need to measure before promising it works?*
+
 ### 42–45 min · Exit ticket
 Answer two:
 1. Name one thing today's image AI *perceived* and one thing it got wrong.
@@ -75,11 +80,11 @@ Answer two:
 ## Big Ideas at a glance
 | AI4K12 Big Idea | Where students see it |
 |---|---|
-| 1. Perception | Swarm Sort turns pixels into labels; the Teach camera |
+| 1. Perception | Swarm Sort turns pixels into labels; the Teach camera; Live Captions turns sound into text |
 | 2. Representation & Reasoning | 1,000 ImageNet labels and confidence scores; the 1,280-number "features" Teach the Swarm trains on; simulation parameters in Science Sweep |
 | 3. Learning | Teach the Swarm rounds and held-out accuracy |
-| 4. Natural Interaction | Private Tutor, streaming tokens, and its mistakes |
-| 5. Societal Impact | Privacy ("0 photos uploaded"), device reuse and e-waste, honest limits |
+| 4. Natural Interaction | Private Tutor, streaming tokens, and its mistakes; captions and translation |
+| 5. Societal Impact | Privacy ("0 photos uploaded", "0 audio saved", each device's "What my device did" panel), accessibility, device reuse and e-waste, the Use cases tab, honest limits |
 
 ## Younger students (grades 3–5)
 Skip the federated-learning vocabulary. Run Swarm Sort ("more helpers, faster job") and Teach the Swarm ("we teach the computer with our own pictures, and the pictures stay here"). Have an adult run the Tutor.
@@ -87,4 +92,6 @@ Skip the federated-learning vocabulary. Run Swarm Sort ("more helpers, faster jo
 ## Honest limits to share with students
 - Recompute speeds up **throughput** (more work per minute), not one single task.
 - An old device alone is slow; the point is that many of them together are useful.
+- Captions run a little behind speech, and translations can be wrong. The Console shows the measured delay.
+- A student's device pauses while they use the Recompute page, and starts again after 30 seconds idle. It can't see other apps.
 - Recompute only shows numbers it measured on your devices. It never guesses energy use; schools that own a plug-in power meter can enter real readings under **Benchmarks → Optional: measured watts**.

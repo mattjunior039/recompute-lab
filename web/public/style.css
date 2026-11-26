@@ -81,6 +81,20 @@ body.node { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(saf
 .node-status { text-align: center; padding: 22px 16px; }
 .node-status .state { font-size: 34px; font-weight: 800; }
 .node-status .sub { color: var(--muted); font-size: 18px; margin-top: 4px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 16px; border-radius: 14px; font-size: 20px; font-weight: 800; border: 2px solid var(--line); background: var(--panel2); }
+.chip.ok { background: #064e3b; border-color: var(--green); color: #a7f3d0; }
+.chip.warn { background: #422006; border-color: var(--amber); color: #fde68a; }
+.chip.info { background: #082f49; border-color: var(--blue); color: #bae6fd; font-size: 17px; }
+.chip.muted { font-size: 16px; font-weight: 600; color: var(--muted); }
+.did h3 { margin-bottom: 4px; }
+.did-list { margin: 8px 0; padding-left: 20px; font-size: 17px; }
+.did-privacy { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0 8px; }
+.did-privacy .zero { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 10px 4px; border-radius: 12px; background: #052e1c; border: 1px solid #065f46; }
+.did-privacy .zero b { font-size: 34px; color: #6ee7b7; line-height: 1.1; }
+.did-privacy .zero span { font-size: 13px; color: #a7f3d0; }
+.reborn-wrap .did { max-width: 560px; text-align: left; }
+@media (max-width: 420px) { .did-privacy { grid-template-columns: repeat(2, 1fr); } }
 .stop-btn { width: 100%; font-size: 30px; padding: 22px; border-radius: 18px; font-weight: 900; letter-spacing: 1px; }
 .go-btn { width: 100%; font-size: 26px; padding: 18px; border-radius: 18px; font-weight: 800; }
 .tabs { display: flex; gap: 6px; background: var(--panel); padding: 6px; border-radius: 14px; border: 1px solid var(--line); }
@@ -127,7 +141,8 @@ body.console { font-size: 18px; }
 .qr { background: #fff; border-radius: 14px; padding: 10px; display: flex; justify-content: center; }
 .qr canvas, .qr img { width: 100%; max-width: 300px; height: auto; image-rendering: pixelated; }
 .qr.small canvas { max-width: 150px; }
-.labs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.labs { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.lab-btn.suggest { border-color: var(--amber); box-shadow: 0 0 0 2px var(--amber) inset; }
 .lab-btn { text-align: left; padding: 16px; border-radius: 16px; min-height: 120px; display: flex; flex-direction: column; gap: 6px; }
 .lab-btn .t { font-size: 22px; font-weight: 800; }
 .lab-btn .d { font-size: 15px; color: var(--muted); font-weight: 500; }
@@ -193,3 +208,43 @@ body.console { font-size: 18px; }
 .flag.hub { background: #38bdf8; color: #04223a; }
 .exp-summary { font-size: 26px; font-weight: 800; color: var(--text); }
 details.card > summary { cursor: pointer; font-size: 18px; list-style-position: inside; }
+
+/* ---------- v2: Swarm Render, Screen Wall, Live Captions, documents, use cases ---------- */
+a.btnlink { display: inline-block; text-decoration: none; background: var(--blue); color: #062235; border-radius: 12px; padding: 10px 16px; font-weight: 700; }
+a.btnlink.small { padding: 4px 10px; font-size: 14px; border-radius: 8px; }
+.render-card { gap: 14px; }
+.render-stage { background: #05070d; border-radius: 12px; overflow: hidden; border: 1px solid var(--line); }
+.render-canvas { display: block; width: 100%; height: auto; image-rendering: auto; }
+.render-hud { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.render-hud .stat { background: var(--panel2); border-radius: 14px; padding: 12px 16px; }
+.big-legend { font-size: 17px; color: var(--text); font-weight: 600; }
+.big-legend i { width: 16px; height: 16px; }
+.wall-scenes { display: flex; flex-wrap: wrap; gap: 10px; }
+.wall-scenes button { font-size: 20px; padding: 14px 20px; }
+.wall-list { display: flex; flex-direction: column; gap: 8px; }
+.wall-item { display: flex; align-items: center; gap: 12px; background: var(--panel2); border: 2px solid var(--line); border-radius: 12px; padding: 10px 12px; cursor: grab; }
+.wall-item.off { opacity: .5; }
+.wall-n { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font-weight: 900; color: #0b1220; flex: none; }
+.wall-canvas { display: block; width: 100%; max-height: 380px; background: #0b1220; border-radius: 10px; }
+.captions { background: #000; border: 2px solid var(--line); min-height: 280px; display: flex; flex-direction: column; justify-content: flex-end; gap: 18px; padding: 28px 32px; }
+.cap-line { opacity: .45; }
+.cap-line.now { opacity: 1; }
+.cap-en { font-size: 46px; font-weight: 800; line-height: 1.2; color: #f8fafc; }
+.cap-es { font-size: 36px; font-weight: 700; line-height: 1.2; color: #fde68a; margin-top: 6px; }
+.cap-line:not(.now) .cap-en { font-size: 30px; }
+.cap-line:not(.now) .cap-es { font-size: 24px; }
+.zero-stat { background: #052e1c !important; border: 2px solid var(--green); }
+.zero-stat .v { color: var(--green); }
+.doc-input { width: 100%; background: var(--panel2); border: 2px solid var(--line); border-radius: 12px; padding: 12px; resize: vertical; }
+.doc-out { display: flex; flex-direction: column; gap: 10px; }
+.doc-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; background: var(--panel2); border-radius: 12px; padding: 12px 14px; }
+.doc-pair .es { color: #fde68a; }
+.uc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+.uc { gap: 8px; }
+.uc.on { border-color: var(--green); box-shadow: 0 0 0 2px var(--green) inset; }
+.uc-t { font-size: 24px; font-weight: 800; display: flex; gap: 10px; align-items: center; }
+.uc-i { font-size: 34px; }
+.uc-p { color: #a7f3d0; }
+.uc button { align-self: flex-start; margin-top: auto; }
+td.big-num { font-size: 28px; font-weight: 800; }
+@media (max-width: 900px) { .render-hud { grid-template-columns: repeat(2, minmax(0, 1fr)); } .doc-pair { grid-template-columns: 1fr; } .cap-en { font-size: 32px; } .cap-es { font-size: 26px; } }

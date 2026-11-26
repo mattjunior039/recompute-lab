@@ -14,6 +14,7 @@ export async function buildWeb(opts: { minify?: boolean } = {}) {
       bench: path.join(src, 'bench/main.ts'),
       trust: path.join(src, 'node/trust.ts'),
       compute: path.join(src, 'workers/compute.ts'),
+      speech: path.join(src, 'workers/speech.ts'),
     },
     outdir: DIST_DIR,
     bundle: true,

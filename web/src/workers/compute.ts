@@ -3,6 +3,7 @@
 
 import { piBatch, sirScenario, type SirParams } from '../shared/kernels';
 import { fetchCached } from '../shared/filecache';
+import { renderTile, type RenderParams } from '../shared/render';
 import type { ClassifyOutput } from '../shared/protocol';
 
 type Ort = typeof import('onnxruntime-web');
@@ -95,6 +96,8 @@ async function runKernel(kernel: string, params: Record<string, unknown>, items:
       return items.map((i) => piBatch(i, params as { samples: number; seed: number }));
     case 'sir':
       return items.map((i) => sirScenario(i, params as unknown as SirParams));
+    case 'render':
+      return items.map((i) => renderTile(i, params as unknown as RenderParams));
     case 'classify': {
       if (!session) throw new Error('model not loaded');
       const count = Number(params.datasetCount) || 1000;

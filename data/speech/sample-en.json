@@ -1,0 +1,5 @@
+{
+  "file": "sample-en.wav",
+  "text": "Today our class is giving old computers a second life. Instead of throwing them away, we connect them together, so they can share the work and help us learn something new.",
+  "source": "Synthesized with macOS text-to-speech (voice: Samantha) from our own text, then converted to 16 kHz mono 16-bit PCM with ffmpeg. Part of this project (MIT)."
+}

@@ -2,10 +2,13 @@
 // Plain JSON only. Nodes only ever run the built-in kernels listed in KERNELS;
 // the Hub sends data (item numbers and parameters), never code.
 
-export const KERNELS = ['classify', 'pi', 'sir', 'tutor'] as const;
+export const KERNELS = ['classify', 'pi', 'sir', 'tutor', 'render', 'caption', 'translate'] as const;
 export type Kernel = (typeof KERNELS)[number];
 
-export type LabId = 'swarm-sort' | 'teach' | 'tutor' | 'sweep';
+export type LabId = 'swarm-sort' | 'teach' | 'tutor' | 'sweep' | 'render' | 'captions' | 'translate';
+
+/** Kernels that hold a big model and run one at a time per device (the "llm" pool). */
+export const HEAVY_KERNELS: readonly Kernel[] = ['tutor', 'caption', 'translate'];
 
 export type DeviceType = 'chromebook' | 'iphone' | 'ipad' | 'android' | 'mac' | 'windows' | 'linux' | 'other';
 
@@ -27,6 +30,7 @@ export type NodeState =
   | 'idle'
   | 'working'
   | 'paused-unplugged'
+  | 'paused-input' // Join mode: the person is using this device (keys, clicks, touches)
   | 'stopped'
   | 'hidden'
   | 'preparing';
@@ -35,6 +39,8 @@ export interface NodeReady {
   mobilenet: boolean;
   dataset: number; // images cached locally
   tutor: string | null; // tutor model id loaded and ready
+  asr?: boolean; // speech-to-text model loaded (captions)
+  mt?: boolean; // English→Spanish model loaded
 }
 
 export interface NodeStatus {
@@ -68,7 +74,30 @@ export type HubToNode =
   | { type: 'models'; models: ModelInfo[] }
   | { type: 'fed:round'; sessionId: string; round: number; classes: string[]; weights: string; dims: [number, number]; epochs: number; lr: number }
   | { type: 'fed:model'; sessionId: string; round: number; weights: string; dims: [number, number] }
-  | { type: 'fed:reset' };
+  | { type: 'fed:reset' }
+  | { type: 'clock'; id: number; hub: number }
+  | WallMsg;
+
+/** Screen Wall: what one node shows. Times are Hub clock (ms since epoch). */
+export interface WallMsg {
+  type: 'wall';
+  scene: WallScene;
+  at: number;
+  /** This node's rectangle in the shared virtual canvas (CSS px), or null if not on the wall. */
+  slot: { x: number; y: number; w: number; h: number } | null;
+  canvas: { w: number; h: number };
+  index: number;
+  count: number;
+  image: string | null;
+  name: string;
+}
+export type WallScene = 'off' | 'black' | 'wake' | 'image' | 'sweep' | 'show';
+
+export interface ScreenInfo {
+  w: number; // CSS px of the visible page
+  h: number;
+  dpr: number;
+}
 
 export type NodeToHub =
   | { type: 'hello'; role: 'node'; room: string; nodeId?: string; name?: string; mode: 'join' | 'reborn'; caps: Capabilities; status: NodeStatus; host?: boolean }
@@ -79,12 +108,14 @@ export type NodeToHub =
   | { type: 'fail'; leaseId: string; error: string }
   | { type: 'release'; leaseIds: string[] }
   | { type: 'fed:update'; sessionId: string; round: number; weights: string | null; n: number; evalCorrect: number[]; evalTotal: number[] }
-  | { type: 'ping' };
+  | { type: 'ping' }
+  | { type: 'clock'; id: number }
+  | { type: 'screen'; screen: ScreenInfo; clock: { offset: number; rtt: number } | null };
 
 export interface ModelInfo {
   id: string;
   title: string;
-  kind: 'onnx' | 'gguf';
+  kind: 'onnx' | 'gguf' | 'hf';
   license: string;
   ready: boolean;
   progress: number; // 0..1
@@ -106,6 +137,16 @@ export interface SirOutput {
   gamma: number;
   peak: number; // mean peak infected fraction
   attack: number; // mean final attack rate
+}
+export interface CaptionOutput {
+  en: string;
+  es: string | null;
+  asrMs: number;
+  mtMs: number;
+}
+export interface TranslateOutput {
+  text: string;
+  ms: number;
 }
 export interface TutorOutput {
   text: string;
@@ -182,6 +223,8 @@ export interface ExperimentView {
   steps: number;
   status: 'preparing' | 'running' | 'done' | 'cancelled';
   rows: { devices: number; names: string[]; seconds: number; itemsPerSec: number; speedup: number }[];
+  /** "1 device vs all": two steps, the first device alone and then every device. */
+  race?: boolean;
 }
 
 export interface FedView {
@@ -215,6 +258,8 @@ export interface ConsoleState {
   run: RunView | null;
   experiment: ExperimentView | null;
   fed: FedView;
+  /** Use-case preset currently picked on the Console (display only). */
+  usecase: string | null;
   impact: {
     devicesEver: number;
     byType: Record<string, number>;
@@ -227,6 +272,84 @@ export interface ConsoleState {
   history: { jobId: string; lab: string; title: string; total: number; seconds: number | null; devices: number; status: string; at: number }[];
   datasetCount: number;
   tutorQuestions: string[];
+  wall: WallView;
+  captions: CaptionsView;
+  renderRace: RenderRaceView | null;
+  nightShift: NightShiftView;
+  fleet: FleetInputs;
+}
+
+/** Live render tiles for the Console (sent outside the state message: they are image data). */
+export interface RenderHeader {
+  jobId: string | null;
+  width: number;
+  height: number;
+  spp: number;
+  pw: number; // preview size
+  ph: number;
+  factor: number;
+  count: number;
+  startedAt: number;
+  finishedAt: number | null;
+  png: boolean;
+}
+export interface RenderTilesMsg {
+  type: 'render-tiles';
+  header: RenderHeader | null;
+  tiles: { item: number; x: number; y: number; w: number; h: number; node: string; t: number; rgb: string }[];
+  reset: boolean;
+}
+
+export interface WallView {
+  scene: WallScene;
+  at: number;
+  gap: number;
+  order: string[]; // node ids, left to right
+  devices: { id: string; name: string; screen: ScreenInfo | null; clock: { offset: number; rtt: number } | null; online: boolean }[];
+  image: string | null;
+}
+
+export interface CaptionLine {
+  seq: number;
+  en: string;
+  es: string | null;
+  node: string;
+  /** Seconds from the end of this piece of speech to the caption being ready on the Hub. */
+  lagSec: number;
+  audioSec: number;
+}
+export interface CaptionsView {
+  on: boolean;
+  translate: boolean;
+  lines: CaptionLine[];
+  pending: number; // audio pieces waiting or being worked on
+  lagSec: number | null; // median of the last 10 pieces (measured)
+  audioSecondsHeard: number;
+  audioSecondsSaved: 0; // audio is processed in memory and dropped; there is nothing that saves it
+  devices: string[];
+  /** Caption timings logged since the last clear (seq, seconds, latency, device; no words): /api/captions.csv. */
+  timedLines: number;
+}
+
+/** The latest Swarm Render timing on 1 device and on the full swarm (from a race or speedup run): /api/render.csv. */
+export interface RenderRaceView {
+  experiment: string;
+  rows: { devices: number; seconds: number }[];
+}
+
+export interface NightShiftView {
+  queue: { id: string; lab: LabId; title: string; options: Record<string, unknown>; status: 'waiting' | 'running' | 'done' | 'cancelled'; addedAt: number; finishedAt: number | null; seconds: number | null }[];
+  armed: boolean;
+  /** Devices that may work now: online, charging, idle. Battery-unknown devices count only if allowed. */
+  eligible: string[];
+  allowUnknownBattery: boolean;
+}
+
+/** Measured inputs for the fleet calculator; null = not measured yet (show nothing). */
+export interface FleetInputs {
+  perDevice: { kernel: string; label: string; unit: string; rate: number; device: string; source: string }[];
+  efficiency: { value: number; devices: number; source: string } | null;
+  captionRtf: { value: number; device: string; source: string } | null;
 }
 
 export type ConsoleCmd =
@@ -246,9 +369,17 @@ export type ConsoleCmd =
   | { cmd: 'watts'; device: string; idle_w: number | null; busy_w: number | null; note?: string }
   | { cmd: 'watts-delete'; device: string }
   | { cmd: 'experiment'; lab: LabId; items: number; order: string[] }
+  | { cmd: 'usecase'; id: string | null }
   | { cmd: 'experiment-cancel' }
   | { cmd: 'host-compute'; on: boolean; workers?: number }
-  | { cmd: 'clear'; what: 'bench' | 'speedup' | 'history' };
+  | { cmd: 'clear'; what: 'bench' | 'speedup' | 'history' }
+  | { cmd: 'render-sync' }
+  | { cmd: 'race'; lab: 'render'; first: string; options?: Record<string, unknown> }
+  | { cmd: 'wall'; scene?: WallScene; order?: string[]; gap?: number }
+  | { cmd: 'captions'; on: boolean; translate?: boolean }
+  | { cmd: 'caption-audio'; seq: number; pcm: string; sampleRate: number; endedAt: number }
+  | { cmd: 'captions-clear' }
+  | { cmd: 'night'; action: 'add' | 'remove' | 'arm' | 'disarm' | 'clear-done' | 'allow-unknown'; lab?: LabId; options?: Record<string, unknown>; id?: string; on?: boolean };
 
 export interface BenchRecord {
   nodeId?: string;

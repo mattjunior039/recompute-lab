@@ -3,6 +3,7 @@
 
 import type { Kernel, LabId, RunView, SirOutput, PiOutput, ClassifyOutput, TutorOutput } from '../../web/src/shared/protocol';
 import type { ChunkPolicy } from '../../web/src/shared/scheduler';
+import { RENDER_PRESETS, tileGrid, type RenderRes } from '../../web/src/shared/render';
 
 export interface LabJobDef {
   kernel: Kernel;
@@ -84,6 +85,35 @@ export function labJob(lab: LabId, options: Record<string, unknown>, datasetCoun
         spotCheck: false, // language model answers legitimately vary between devices
       };
     }
+    case 'render': {
+      const res = (Object.keys(RENDER_PRESETS).includes(String(options.res)) ? options.res : '8k') as RenderRes;
+      const { width, height } = RENDER_PRESETS[res];
+      const spp = num('spp', 2, 1, 16);
+      const params = { width, height, tile: 160, spp, seed: 2026 };
+      const { count } = tileGrid(params);
+      return {
+        kernel: 'render',
+        title: `Swarm Render: ${width.toLocaleString('en-US')}×${height.toLocaleString('en-US')} picture (${res.toUpperCase()}), ${count.toLocaleString('en-US')} tiles`,
+        unit: 'tiles',
+        total: count,
+        params,
+        chunk: { initial: 1, min: 1, max: 6, targetSec: 1.5, guessSecPerItem: 2 },
+        spotCheck: true,
+      };
+    }
+    case 'translate': {
+      const paras = Array.isArray(options.paragraphs) ? (options.paragraphs as unknown[]).map((p) => String(p).trim().slice(0, 2000)).filter(Boolean).slice(0, 300) : [];
+      if (!paras.length) throw new Error('Paste some text to translate first.');
+      return {
+        kernel: 'translate',
+        title: `Translate a document: ${paras.length} paragraph${paras.length === 1 ? '' : 's'}, English → Spanish`,
+        unit: 'paragraphs',
+        total: paras.length,
+        params: { paragraphs: paras, from: 'en', to: 'es' },
+        chunk: { initial: 1, min: 1, max: 1, targetSec: 1, guessSecPerItem: 15 },
+        spotCheck: false, // translations are checked by people, not by a second device
+      };
+    }
     default:
       throw new Error(`lab ${lab} is not a batch job`);
   }
@@ -93,6 +123,11 @@ export function labJob(lab: LabId, options: Record<string, unknown>, datasetCoun
 export function compareOutputs(kernel: string, a: unknown, b: unknown): boolean {
   if (kernel === 'classify') return (a as ClassifyOutput)?.label === (b as ClassifyOutput)?.label;
   if (kernel === 'pi') return (a as PiOutput)?.inside === (b as PiOutput)?.inside && (a as PiOutput)?.samples === (b as PiOutput)?.samples;
+  if (kernel === 'render') {
+    // Browsers may round the last bit of Math.exp/pow differently; the average brightness of a tile must still match.
+    const x = a as { sum: number; x: number; y: number }, y = b as { sum: number; x: number; y: number };
+    return x?.x === y?.x && x?.y === y?.y && Math.abs(x.sum - y.sum) < 0.5;
+  }
   if (kernel === 'sir') return Math.abs((a as SirOutput).attack - (b as SirOutput).attack) < 0.02 && Math.abs((a as SirOutput).peak - (b as SirOutput).peak) < 0.02;
   return true;
 }
@@ -117,6 +152,7 @@ export class RunTracker {
   private pi = { inside: 0, samples: 0 };
   private sir: (SirOutput | null)[] = [];
   private answers: (TutorOutput & { i: number; node: string; question: string })[] = [];
+  private translations: { i: number; en: string; es: string; node: string; seconds: number }[] = [];
 
   constructor(
     readonly jobId: string,
@@ -152,6 +188,11 @@ export class RunTracker {
         case 'sir':
           this.sir[it.i] = o as unknown as SirOutput;
           break;
+        case 'translate': {
+          const paras = this.def.params.paragraphs as string[];
+          this.translations.push({ i: it.i, en: paras[it.i], es: String((o as { text?: string }).text ?? ''), node: nodeName(it.nodeId), seconds: round(Number((o as { ms?: number }).ms ?? 0) / 1000, 1) });
+          break;
+        }
         case 'tutor': {
           const q = (this.def.params.questions as string[])[it.i];
           this.answers.push({ ...(o as unknown as TutorOutput), i: it.i, node: nodeName(it.nodeId), question: q });
@@ -283,6 +324,11 @@ export class RunTracker {
       extra.sir = { grid: this.def.params.grid, cells: this.sir.map((c) => (c ? [round(c.attack, 3), round(c.peak, 3)] : null)), params: this.def.params };
     } else if (this.def.kernel === 'tutor') {
       extra.answers = this.answers.slice().sort((a, b) => a.i - b.i);
+    } else if (this.def.kernel === 'translate') {
+      extra.translations = this.translations.slice().sort((a, b) => a.i - b.i);
+    } else if (this.def.kernel === 'render') {
+      const p = this.def.params;
+      extra.render = { width: p.width, height: p.height, spp: p.spp, tile: p.tile };
     }
     return {
       jobId: this.jobId,

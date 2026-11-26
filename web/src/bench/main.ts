@@ -5,6 +5,7 @@ import { h, clear, fmtNum } from '../shared/dom';
 import { probeCaps, defaultWorkers, webgpuAdapter } from '../shared/device';
 import { Engine } from '../node/engine';
 import { Tutor } from '../node/tutor';
+import { Speech, wavToPcm16k } from '../node/speech';
 import type { BenchRecord, Capabilities, ModelInfo } from '../shared/protocol';
 
 const app = document.getElementById('app')!;
@@ -120,6 +121,37 @@ async function piBench(workers: number) {
   }
 }
 
+/** Swarm Render speed: renders fixed 4K tiles; 1 ray = 1 pixel sample. */
+async function renderBench(workers: number) {
+  const status = line(`Swarm Render (${workers} workers): rendering…`);
+  const eng = new Engine(workers);
+  try {
+    const params = { width: 3840, height: 2160, tile: 160, spp: 2, seed: 2026 };
+    await eng.run('render', params, [0]);
+    // a fixed band of tiles across the middle of the picture (sky, towers and street)
+    const items = Array.from({ length: workers * 6 }, (_, k) => 24 * 6 + ((k * 5) % (24 * 6)));
+    const t0 = performance.now();
+    let next = 0;
+    let rays = 0;
+    await Promise.all(Array.from({ length: workers }, async () => {
+      while (next < items.length) {
+        const { outputs } = await eng.run('render', params, [items[next++]]);
+        for (const o of outputs as { w: number; h: number }[]) rays += o.w * o.h * params.spp;
+      }
+    }));
+    const sec = (performance.now() - t0) / 1000;
+    const mrays = rays / sec / 1e6;
+    status.textContent = `✓ Swarm Render (${workers} workers): ${fmtNum(mrays, 2)} million rays/s`;
+    status.className = 'banner ok';
+    await save('render tiles', 'js', workers, mrays, 'Mrays/s', `${items.length} tiles of 160×160 at 2 samples/pixel in ${sec.toFixed(2)} s`);
+  } catch (e) {
+    status.textContent = `✗ Render failed: ${e instanceof Error ? e.message : e}`;
+    status.className = 'banner bad';
+  } finally {
+    eng.terminate();
+  }
+}
+
 async function tutorBench(info: ModelInfo) {
   const status = line(`Tutor ${info.title}: loading (first time downloads ${Math.round(info.sizeBytes / 1e6)} MB from the Hub)…`);
   const tutor = new Tutor();
@@ -140,6 +172,60 @@ async function tutorBench(info: ModelInfo) {
   }
 }
 
+// Fixed sentences so translation speed is comparable between devices.
+const MT_SENTENCES = [
+  'Please open your notebooks to page twelve.',
+  'Today we will learn how computers share work over a network.',
+  'Each device solves a small part of the problem.',
+  'When everyone is finished, we compare the results together.',
+  'Old laptops can still be useful in a classroom.',
+  'Remember to save your work before the bell rings.',
+  'Who can explain the answer in their own words?',
+  'Tomorrow we will measure how fast each device is.',
+];
+
+/** Captions speed: Whisper on a bundled clip (real-time factor) and English→Spanish sentences per second. */
+async function captionsBench() {
+  const asrInfo = models.find((m) => m.id === 'whisper-tiny-en');
+  const mtInfo = models.find((m) => m.id === 'opus-mt-en-es');
+  const status = line('Captions: loading speech models…');
+  const sp = new Speech();
+  try {
+    await sp.load({ asr: asrInfo?.ready ? asrInfo : undefined, mt: mtInfo?.ready ? mtInfo : undefined }, (f) => (status.textContent = `Captions: loading speech models ${Math.round(f * 100)}%`));
+    const summary: string[] = [];
+    if (sp.ready.asr) {
+      // sample-en.wav: synthesized with macOS text-to-speech from our own text (see data/speech/sample-en.json).
+      const pcm = wavToPcm16k(await (await fetch('/data/speech/sample-en.wav')).arrayBuffer());
+      const audioSec = pcm.length / 16000;
+      status.textContent = 'Captions: warming up…';
+      await sp.asr(pcm.subarray(0, 16000 * 2));
+      status.textContent = `Captions: transcribing ${audioSec.toFixed(1)} s of speech…`;
+      const r = await sp.asr(pcm);
+      const rtf = audioSec / (r.ms / 1000);
+      summary.push(`${fmtNum(rtf, 2)}× real time`);
+      await save('captions whisper-tiny-en', sp.backend, sp.threads, rtf, 'x real time', `${audioSec.toFixed(1)} s audio in ${(r.ms / 1000).toFixed(2)} s: "${r.text}"`);
+    }
+    if (sp.ready.mt) {
+      status.textContent = 'Captions: translating to Spanish…';
+      await sp.translate([MT_SENTENCES[0]]);
+      const r = await sp.translate(MT_SENTENCES);
+      const sps = r.sentences / (r.ms / 1000);
+      summary.push(`${fmtNum(sps, 2)} sentences/s translated`);
+      await save('translate opus-mt-en-es', sp.backend, sp.threads, sps, 'sentences/s', `${r.sentences} sentences in ${(r.ms / 1000).toFixed(2)} s`);
+    }
+    if (!summary.length) throw new Error('speech models are not on the Hub yet');
+    status.textContent = `✓ Captions: ${summary.join(', ')} (${sp.threads} thread${sp.threads === 1 ? '' : 's'}; load ${(sp.loadMs / 1000).toFixed(1)} s)`;
+    status.className = 'banner ok';
+  } catch (e) {
+    status.textContent = `✗ Captions failed: ${e instanceof Error ? e.message : e}`;
+    status.className = 'banner bad';
+  } finally {
+    sp.unload();
+  }
+}
+
+Object.assign(globalThis, { __recomputeSpeech: { Speech, wavToPcm16k } }); // used by scripts/speech-check.ts
+
 async function main() {
   const workers = Math.max(1, Number(qs.get('workers')) || defaultWorkers());
   caps = await probeCaps(workers);
@@ -155,6 +241,8 @@ async function main() {
     img: h('input', { type: 'checkbox', checked: true }) as HTMLInputElement,
     gpu: h('input', { type: 'checkbox', checked: false, disabled: !gpu }) as HTMLInputElement,
     pi: h('input', { type: 'checkbox', checked: true }) as HTMLInputElement,
+    render: h('input', { type: 'checkbox', checked: true }) as HTMLInputElement,
+    captions: h('input', { type: 'checkbox', checked: false, disabled: !models.some((m) => m.kind === 'hf' && m.ready) }) as HTMLInputElement,
     llm: models.filter((m) => m.kind === 'gguf' && m.ready).map((m) => [m, h('input', { type: 'checkbox', checked: m.id === 'smollm2-360m' }) as HTMLInputElement] as const),
   };
   const run = h('button', { class: 'primary big' }, '▶ Run benchmarks');
@@ -168,6 +256,8 @@ async function main() {
       }
       if (checks.gpu.checked) await classifyBench(1, true);
       if (checks.pi.checked) await piBench(workers);
+      if (checks.render.checked) await renderBench(workers);
+      if (checks.captions.checked) await captionsBench();
       for (const [m, c] of checks.llm) if (c.checked) await tutorBench(m);
       line('Done. Results are saved on the Hub (Console → Benchmarks).', 'ok');
     } finally {
@@ -204,6 +294,8 @@ async function main() {
         label(checks.img, `Image classification, MobileNetV3 (${IMAGES} photos; 1 worker, then ${workers})`),
         label(checks.gpu, `Image classification on WebGPU${gpu ? '' : ' (not available here)'}`),
         label(checks.pi, 'Monte Carlo π (pure CPU)'),
+        label(checks.render, 'Swarm Render (pure CPU, million rays per second)'),
+        label(checks.captions, `Captions speed: speech-to-text (× real time) and English→Spanish (sentences/s)${checks.captions.disabled ? ' (speech models not on the Hub yet)' : ''}`),
         ...checks.llm.map(([m, c]) => label(c, `Tutor: ${m.title} (tokens per second)`)),
         h('div', { class: 'muted small' }, 'Plug the device in and keep this screen on. Close other tabs. Each test takes about 10–60 seconds; the tutor test downloads the model once.'),
         run,

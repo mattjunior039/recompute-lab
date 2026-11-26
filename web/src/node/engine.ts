@@ -39,6 +39,8 @@ export class Engine {
   backend = 'wasm';
   modelError: string | null = null;
   throttle = 0;
+  /** Where the image model came from, so a restarted worker can load it again (from this device's cache). */
+  private modelSrc: { url: string; sha: string; gpu: boolean } | null = null;
   private perf = new Map<string, { samples: number[]; base: number | null; ewma: number | null; slowRuns: number; coolSince: number | null }>();
 
   constructor(
@@ -126,26 +128,8 @@ export class Engine {
     this.modelLoading = (async () => {
       try {
         const bytes = await fetchCached(file.url, { sha: file.sha256, onProgress: opts.onProgress });
-        const results = await Promise.all(
-          this.slots.map(
-            (slot) =>
-              new Promise<string>((resolve, reject) => {
-                const prev = slot.w.onmessage;
-                slot.w.onmessage = (e: MessageEvent<WorkerOut>) => {
-                  const m = e.data;
-                  if (m.type === 'model-ready') {
-                    slot.model = true;
-                    slot.w.onmessage = prev;
-                    resolve(m.backend);
-                  } else if (m.type === 'model-error') {
-                    slot.w.onmessage = prev;
-                    reject(new Error(m.error));
-                  } else prev?.call(slot.w, e);
-                };
-                slot.w.postMessage({ type: 'init-model', model: bytes.slice(0), ortBase: '/vendor/ort/', gpu: opts.gpu } satisfies WorkerIn);
-              }),
-          ),
-        );
+        const results = await Promise.all(this.slots.map((slot) => this.initModel(slot, bytes, opts.gpu)));
+        this.modelSrc = { url: file.url, sha: file.sha256, gpu: opts.gpu };
         this.backend = results[0] ?? 'wasm';
         this.modelReady = true;
         this.modelError = null;
@@ -158,6 +142,58 @@ export class Engine {
       }
     })();
     return this.modelLoading;
+  }
+
+  private initModel(slot: Slot, bytes: ArrayBuffer, gpu: boolean) {
+    return new Promise<string>((resolve, reject) => {
+      const prev = slot.w.onmessage;
+      slot.w.onmessage = (e: MessageEvent<WorkerOut>) => {
+        const m = e.data;
+        if (m.type === 'model-ready') {
+          slot.model = true;
+          slot.w.onmessage = prev;
+          resolve(m.backend);
+        } else if (m.type === 'model-error') {
+          slot.w.onmessage = prev;
+          reject(new Error(m.error));
+        } else prev?.call(slot.w, e);
+      };
+      slot.w.postMessage({ type: 'init-model', model: bytes.slice(0), ortBase: '/vendor/ort/', gpu } satisfies WorkerIn);
+    });
+  }
+
+  /**
+   * Stop all class work right now (Stop button, pause while in use): queued work is
+   * dropped and workers in the middle of a job are shut down and replaced by fresh
+   * ones, so the processor is free at once. The Hub gives that work to another device.
+   */
+  interrupt() {
+    this.cancelQueued();
+    this.slots = this.slots.map((slot) => {
+      const running = [...this.pending].filter(([, p]) => p.slot === slot);
+      if (!running.length || running.some(([, p]) => p.task.msg.type !== 'run')) return slot; // Teach photos finish
+      slot.w.terminate();
+      for (const [id, p] of running) {
+        this.pending.delete(id);
+        p.task.reject(new Error('cancelled'));
+      }
+      const fresh = this.spawn();
+      fresh.enabled = slot.enabled;
+      if (slot.model && this.modelSrc) {
+        const src = this.modelSrc;
+        fresh.busy = true; // no work until the model is back in this worker
+        void fetchCached(src.url, { sha: src.sha })
+          .then((bytes) => this.initModel(fresh, bytes, src.gpu))
+          .catch((e) => console.warn('model reload failed', e))
+          .finally(() => {
+            fresh.busy = false;
+            this.drain();
+            this.ev.onChange?.();
+          });
+      }
+      return fresh;
+    });
+    this.ev.onChange?.();
   }
 
   /** Run a built-in kernel on some items. */

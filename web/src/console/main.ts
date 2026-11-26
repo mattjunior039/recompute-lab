@@ -5,6 +5,7 @@ import QRCode from 'qrcode';
 import { h, clear, fmtInt, fmtNum, fmtTime, fmtBytes, toast, DEVICE_ICON } from '../shared/dom';
 import { lineChart, barChart } from '../shared/charts';
 import type { ConsoleCmd, ConsoleState, LabId, NodeView, RunView } from '../shared/protocol';
+import * as v2 from './v2';
 
 const qs = new URLSearchParams(location.search);
 const KEY = qs.get('key') ?? '';
@@ -30,7 +31,9 @@ function applyZoom() {
 applyZoom();
 
 let S: ConsoleState | null = null;
-let view: 'lab' | 'devices' | 'bench' | 'setup' = (qs.get('view') as never) ?? 'lab';
+type View = 'lab' | 'uses' | 'wall' | 'devices' | 'bench' | 'setup';
+let view: View = (qs.get('view') as never) ?? 'lab';
+let showDoc = false; // the Translate-a-document panel is open on the Lab page
 let ws: WebSocket | null = null;
 let connected = false;
 let labels: string[] = [];
@@ -44,13 +47,17 @@ function connect() {
   ws = new WebSocket(`${proto}//${location.host}/ws?role=console${KEY ? `&key=${encodeURIComponent(KEY)}` : ''}`);
   ws.onopen = () => {
     connected = true;
+    ws?.send(JSON.stringify({ cmd: 'render-sync' }));
   };
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.type === 'state') {
       S = m.state;
+      v2.setState(m.state);
+      v2.noteHubTime(m.state.t);
       update();
-    } else if (m.type === 'toast') toast(m.text, m.level);
+    } else if (m.type === 'render-tiles') v2.onRenderTiles(m);
+    else if (m.type === 'toast') toast(m.text, m.level);
   };
   ws.onclose = () => {
     connected = false;
@@ -96,6 +103,18 @@ function canvas(id: string) {
   return c;
 }
 
+function go(v: string) {
+  if (v !== view) window.scrollTo(0, 0);
+  view = v as View;
+  regions.clear();
+  updateHead();
+  update();
+}
+v2.initV2({ region, canvas, cmd, update: () => update(), keyQ, go });
+v2.onOpenDoc(() => {
+  showDoc = true;
+});
+
 // ---------- layout ----------
 const head = h('header', { class: 'c-head' });
 const main = h('main', { class: 'c-main' });
@@ -111,18 +130,13 @@ function layout() {
 function updateHead() {
   const nav = (id: typeof view, label: string) => {
     const b = h('button', { class: view === id ? 'on' : '' }, label);
-    b.onclick = () => {
-      view = id;
-      regions.clear();
-      updateHead();
-      update();
-    };
+    b.onclick = () => go(id);
     return b;
   };
   clear(
     head,
     h('div', { class: 'brand' }, h('img', { src: '/static/icon.svg', alt: '' }), h('div', null, h('div', { class: 'name' }, 'Re', h('b', null, 'compute')), h('div', { class: 'tagline' }, 'Rethink. Reuse. Recompute.'))),
-    h('nav', { class: 'c-nav' }, nav('lab', 'Lab'), nav('devices', 'Devices'), nav('bench', 'Benchmarks'), nav('setup', 'Setup')),
+    h('nav', { class: 'c-nav' }, nav('lab', 'Lab'), nav('uses', 'Use cases'), nav('wall', 'Wall'), nav('devices', 'Devices'), nav('bench', 'Benchmarks'), nav('setup', 'Setup')),
     region('head-flags', [S?.demo, connected, S?.canControl], () => [
       h(
         'div',
@@ -183,6 +197,9 @@ const LABS: { id: LabId; t: string; d: string }[] = [
   { id: 'teach', t: '📷 Teach the Swarm', d: 'Train a class model together. Photos never leave each device.' },
   { id: 'tutor', t: '💬 Private Tutor', d: 'An offline AI tutor. Swarm answers a question list.' },
   { id: 'sweep', t: '🧪 Science Sweep', d: 'Estimate π or sweep a disease-spread model.' },
+  { id: 'render', t: '🎨 Swarm Render', d: 'Render one huge picture, tile by tile, across every device.' },
+  { id: 'captions', t: '🎙️ Live Captions', d: 'Offline speech-to-text, with a Spanish line. No audio is saved.' },
+  { id: 'translate', t: '📄 Translate a document', d: 'Paragraphs translated in parallel, offline. Or summarize.' },
 ];
 
 function launcher(s: ConsoleState) {
@@ -190,14 +207,22 @@ function launcher(s: ConsoleState) {
   const mobilenet = s.models.find((m) => m.id === 'mobilenetv3');
   const gguf = s.models.filter((m) => m.kind === 'gguf');
   if (!gguf.find((m) => m.id === tutorModel) && gguf[0]) tutorModel = gguf[0].id;
-  const key = [running, s.lab, s.run?.lab, s.demo, mobilenet?.ready, gguf.map((m) => [m.id, m.ready]), swarmCount, sweepKind, tutorModel, s.datasetCount, s.experiment?.status];
+  const speech = s.models.find((m) => m.id === 'whisper-tiny-en');
+  const mt = s.models.find((m) => m.id === 'opus-mt-en-es');
+  const key = [running, s.lab, s.run?.lab, s.demo, mobilenet?.ready, gguf.map((m) => [m.id, m.ready]), swarmCount, sweepKind, tutorModel, s.datasetCount, s.experiment?.status, speech?.ready, mt?.ready, showDoc, v2.pendingLab, v2.renderOpts];
   return region('launcher', key, () => {
     const btn = (l: (typeof LABS)[number], extra: Node | null, disabled = false) => {
-      const b = h('button', { class: `lab-btn ${(s.lab ?? s.run?.lab) === l.id ? 'on' : ''}` }, h('span', { class: 't' }, l.t), h('span', { class: 'd' }, l.d), extra);
+      const on = (showDoc ? 'translate' : (s.lab ?? s.run?.lab)) === l.id;
+      const b = h('button', { class: `lab-btn ${on ? 'on' : ''} ${v2.pendingLab === l.id && !on ? 'suggest' : ''}` }, h('span', { class: 't' }, l.t), h('span', { class: 'd' }, l.d), extra);
       b.disabled = disabled;
       b.onclick = (e) => {
         if ((e.target as HTMLElement).closest('select')) return;
-        if (l.id === 'swarm-sort') cmd({ cmd: 'start', lab: 'swarm-sort', options: { count: swarmCount } });
+        v2.clearPendingLab();
+        showDoc = l.id === 'translate';
+        if (l.id === 'translate') return update();
+        if (l.id === 'render') cmd({ cmd: 'start', lab: 'render', options: { res: v2.renderOpts.res, spp: v2.renderOpts.spp } });
+        else if (l.id === 'captions') cmd({ cmd: 'captions', on: true, translate: !!mt?.ready });
+        else if (l.id === 'swarm-sort') cmd({ cmd: 'start', lab: 'swarm-sort', options: { count: swarmCount } });
         else if (l.id === 'sweep') cmd({ cmd: 'start', lab: 'sweep', options: sweepKind === 'pi' ? { kind: 'pi' } : { kind: 'sir' } });
         else if (l.id === 'tutor') cmd({ cmd: 'start', lab: 'tutor', options: { model: tutorModel } });
         else cmd({ cmd: 'start', lab: 'teach' });
@@ -228,7 +253,7 @@ function launcher(s: ConsoleState) {
     return h(
       'div',
       { class: 'card col' },
-      h('div', { class: 'labs' }, btn(LABS[0], ssExtra, !mobilenet?.ready), btn(LABS[1], null), btn(LABS[2], tuExtra, !gguf.some((m) => m.ready)), btn(LABS[3], swExtra)),
+      h('div', { class: 'labs' }, btn(LABS[0], ssExtra, !mobilenet?.ready), btn(LABS[1], null), btn(LABS[2], tuExtra, !gguf.some((m) => m.ready)), btn(LABS[3], swExtra), btn(LABS[4], v2.renderExtra()), btn(LABS[5], null, !speech?.ready), btn(LABS[6], null, !mt?.ready && !gguf.some((m) => m.ready))),
       h('div', { class: 'row' }, stop, reset, !mobilenet?.ready ? h('span', { class: 'pill warn' }, mobilenet?.error ? `Image model: ${mobilenet.error}` : `Image model downloading to the Hub… ${Math.round((mobilenet?.progress ?? 0) * 100)}%`) : null),
     );
   });
@@ -289,6 +314,8 @@ function runPanel(run: RunView, s: ConsoleState) {
         : null,
     ),
   );
+  if (run.kernel === 'render') return [...v2.renderPanel(s), v2.racePanel(s), h('div', { class: 'card col' }, top), charts, devTable];
+  if (run.kernel === 'translate') return [v2.docPanel(s), h('div', { class: 'card col' }, top), extraPanel(run), devTable];
   return [h('div', { class: 'card col' }, top), charts, extraPanel(run), devTable];
 }
 
@@ -394,6 +421,7 @@ function extraPanel(run: RunView) {
       ),
     );
   }
+  if (run.kernel === 'translate') return v2.translateExtra(run);
   return h('div');
 }
 
@@ -498,8 +526,9 @@ function demoCard(s: ConsoleState) {
   const tutorId = s.models.find((m) => m.kind === 'gguf' && m.ready)?.id ?? null;
   const key = [online.map((n) => [n.id, n.name, n.status.ready, n.status.state]), s.models.map((m) => [m.id, m.ready]), s.datasetCount];
   return region('demo', key, () => {
+    const speech = s.models.some((m) => m.id === 'whisper-tiny-en' && m.ready) && s.models.some((m) => m.id === 'opus-mt-en-es' && m.ready);
     const prep = h('button', { class: 'blue' }, '⬇ Prepare all devices (models + photos)');
-    prep.onclick = () => cmd({ cmd: 'node', nodeId: '*', action: 'prepare', args: { all: true, ...(tutorId ? { tutor: tutorId } : {}) } });
+    prep.onclick = () => cmd({ cmd: 'node', nodeId: '*', action: 'prepare', args: { all: true, ...(tutorId ? { tutor: tutorId } : {}), ...(speech ? { speech: { asr: true, mt: true } } : {}) } });
     const ok = (b: boolean) => (b ? '✓' : '…');
     return h(
       'div',
@@ -511,7 +540,7 @@ function demoCard(s: ConsoleState) {
         ...s.models.flatMap((m) => [h('span', { class: 'k' }, m.title), h('span', null, m.ready ? '✓ on the Hub' : m.error ? `✗ ${m.error}` : `downloading ${Math.round(m.progress * 100)}%`)]),
         ...online.flatMap((n) => [
           h('span', { class: 'k' }, `${DEVICE_ICON[n.caps.deviceType] ?? '💻'} ${n.name}`),
-          h('span', null, `${ok(n.status.ready.mobilenet)} image model · ${ok(n.status.ready.dataset >= s.datasetCount)} photos ${n.status.ready.dataset}/${s.datasetCount} · ${n.status.ready.tutor ? '✓ tutor' : '… tutor'} · ${n.status.state}`),
+          h('span', null, `${ok(n.status.ready.mobilenet)} image model · ${ok(n.status.ready.dataset >= s.datasetCount)} photos ${n.status.ready.dataset}/${s.datasetCount} · ${n.status.ready.tutor ? '✓ tutor' : '… tutor'}${n.host ? '' : ` · ${ok(!!n.status.ready.asr && !!n.status.ready.mt)} captions`} · ${n.status.state}`),
         ]),
       ),
       h('div', { class: 'row' }, prep),
@@ -525,8 +554,12 @@ function labView(s: ConsoleState) {
   const d = demoCard(s);
   if (d) out.push(d);
   out.push(launcher(s));
-  if (s.lab === 'teach') out.push(...teachPanel(s));
+  if (s.lab !== 'captions') v2.captionsLeft();
+  if (s.lab === 'captions') out.push(...v2.captionsView(s));
+  else if (s.lab === 'teach') out.push(...teachPanel(s));
+  else if (showDoc && s.run?.kernel !== 'translate' && !(s.run?.status === 'running' && s.run.kernel === 'tutor')) out.push(v2.docPanel(s), ...(s.run ? runPanel(s.run, s) : []));
   else if (s.run) out.push(...runPanel(s.run, s));
+  else if (s.lab === 'render') out.push(...v2.renderPanel(s), v2.racePanel(s));
   else if (s.fed.round > 0 || s.nodes.some((n) => n.status.fedPhotos.some((v) => v > 0))) out.push(...teachPanel(s));
   else out.push(region('empty', [s.nodes.length], () => h('div', { class: 'card', style: 'text-align:center;padding:40px' }, h('div', { class: 'big' }, `${s.nodes.filter((n) => n.online).length} devices connected`), h('div', { class: 'muted' }, 'Scan the QR code to join, then pick a lab.'))));
   if (s.experiment) out.push(experimentPanel(s));
@@ -538,7 +571,7 @@ function labView(s: ConsoleState) {
 function nodeCard(n: NodeView, s: ConsoleState, compact: boolean) {
   const st = n.status;
   const stateCls = !n.online ? 'bad' : st.state === 'working' ? 'ok' : st.state === 'idle' ? 'info' : 'warn';
-  const stateTxt = !n.online ? 'offline' : { idle: 'ready', working: 'computing', 'paused-unplugged': 'paused: unplugged', stopped: 'stopped', hidden: 'screen off', preparing: 'getting ready' }[st.state];
+  const stateTxt = !n.online ? 'offline' : { idle: 'ready', working: 'computing', 'paused-unplugged': 'paused: unplugged', 'paused-input': 'paused: in use', stopped: 'stopped', hidden: 'screen off', preparing: 'getting ready' }[st.state];
   const batt = st.battery === 'charging' ? '🔌' : st.battery === 'on-battery' ? '🔋' : '❔';
   const card = h(
     'div',
@@ -649,7 +682,7 @@ function experimentPanel(s: ConsoleState) {
     h(
       'div',
       { class: 'card col' },
-      h('h3', null, `Speedup experiment · ${ex.lab === 'sweep' ? 'Science Sweep (π)' : 'Swarm Sort'} · ${fmtInt(ex.items)} ${ex.lab === 'sweep' ? 'batches' : 'photos'} · ${status}`),
+      h('h3', null, ex.lab === 'render' ? `${ex.race ? 'Race: 1 device vs all' : 'Speedup experiment'} · Swarm Render · ${fmtInt(ex.items)} tiles · ${status}` : `Speedup experiment · ${ex.lab === 'sweep' ? 'Science Sweep (π)' : 'Swarm Sort'} · ${fmtInt(ex.items)} ${ex.lab === 'sweep' ? 'batches' : 'photos'} · ${status}`),
       h('div', { class: 'muted small' }, `Order: ${ex.order.map((n, i) => `${i + 1}. ${n}`).join('  ')}`),
       experimentSummary(ex),
       h(
@@ -920,7 +953,7 @@ function update() {
   }
   const s = S;
   main.classList.toggle('wide', view !== 'lab');
-  const parts = view === 'lab' ? labView(s) : view === 'devices' ? devicesView(s) : view === 'bench' ? benchView(s) : [setupView(s)];
+  const parts = view === 'lab' ? labView(s) : view === 'uses' ? v2.useCasesView(s) : view === 'wall' ? v2.wallView(s) : view === 'devices' ? devicesView(s) : view === 'bench' ? benchView(s) : [setupView(s)];
   syncChildren(content, parts);
   syncChildren(side, view === 'lab' ? sideView(s) : []);
   syncHostFrame(s);

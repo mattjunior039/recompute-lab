@@ -7,3 +7,4 @@ certs/
 web/dist/
 test-results/
 playwright-report/
+scripts/tmp/

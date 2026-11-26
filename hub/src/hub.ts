@@ -3,13 +3,28 @@
 // keeps the Console's picture of the classroom up to date.
 
 import crypto from 'node:crypto';
+import path from 'node:path';
 import type { WebSocket } from 'ws';
 import type { DB } from './db';
 import type { ModelStore } from './models';
 import { FedSession } from './fedavg';
 import { DEFAULT_QUESTIONS, labJob, RunTracker, compareOutputs } from './labs';
 import { Scheduler, type Job } from '../../web/src/shared/scheduler';
+import { RenderStore } from './render-store';
+import { CaptionOrderer } from './captions';
+import { DATA_DIR } from './config';
+import { wallLayout } from '../../web/src/shared/wall';
+import { KERNELS } from '../../web/src/shared/protocol';
+import type { RenderOutput, RenderParams } from '../../web/src/shared/render';
 import type {
+  CaptionLine,
+  CaptionOutput,
+  FleetInputs,
+  NightShiftView,
+  RenderTilesMsg,
+  ScreenInfo,
+  WallMsg,
+  WallScene,
   Capabilities,
   ConsoleCmd,
   ConsoleState,
@@ -20,6 +35,7 @@ import type {
   NodeStatus,
   NodeToHub,
   NodeView,
+  RenderRaceView,
 } from '../../web/src/shared/protocol';
 
 type Pool = 'cpu' | 'llm';
@@ -38,7 +54,19 @@ interface NodeRec {
   itemsSession: number;
   ip: string;
   host: boolean;
+  screen: ScreenInfo | null;
+  clock: { offset: number; rtt: number } | null;
 }
+
+type NightItem = NightShiftView['queue'][number];
+
+const LAB_TITLES: Record<string, string> = {
+  'swarm-sort': 'Swarm Sort',
+  sweep: 'Science Sweep',
+  render: 'Swarm Render',
+  tutor: 'Private Tutor',
+  translate: 'Translate a document',
+};
 
 interface ConsoleConn {
   ws: WebSocket;
@@ -59,6 +87,8 @@ interface Experiment {
   rows: ExperimentView['rows'];
   timer?: NodeJS.Timeout;
   prepUntil?: number;
+  race: boolean;
+  options: Record<string, unknown>;
 }
 
 export interface HubInfo {
@@ -108,12 +138,32 @@ export class Hub {
   private timers: NodeJS.Timeout[] = [];
   private dirty = true;
   private consoleMsgs: { t: number; level: 'info' | 'warn'; text: string }[] = [];
+  readonly render: RenderStore;
+  private renderReset = false;
+  private renderHeaderChanged = false;
+  usecase: string | null;
+  wall: { scene: WallScene; at: number; gap: number; order: string[] };
+  captions = {
+    on: false,
+    translate: true,
+    orderer: new CaptionOrderer(),
+    seq: 0,
+    lines: [] as CaptionLine[],
+    /** Timing only (no words), kept until cleared, for captions.csv. */
+    timing: [] as { seq: number; audioSec: number; lagSec: number; node: string; translated: boolean }[],
+    lags: [] as number[],
+    heard: 0,
+    devices: new Set<string>(),
+    jobs: new Map<string, { seq: number }>(),
+  };
+  renderRace: RenderRaceView | null = null;
+  night: { queue: NightItem[]; armed: boolean; allowUnknown: boolean; running: { id: string; jobId: string } | null };
 
   constructor(
     private db: DB,
     private models: ModelStore,
     public info: HubInfo,
-    opts: { now?: () => number; rng?: () => number; tickMs?: number } = {},
+    opts: { now?: () => number; rng?: () => number; tickMs?: number; dataDir?: string } = {},
   ) {
     this.sched = new Scheduler(
       { now: opts.now, rng: opts.rng, compare: compareOutputs },
@@ -135,6 +185,18 @@ export class Hub {
     this.hostCompute = { on: hc?.on === true, workers: this.clampHostWorkers(Number(hc?.workers) || this.defaultHostWorkers()) };
     this.fed = new FedSession(db.get('fedSession') ?? `fed-${Date.now().toString(36)}`);
     db.set('fedSession', this.fed.id);
+    this.render = new RenderStore(path.join(opts.dataDir ?? DATA_DIR, 'renders'));
+    this.usecase = db.get('usecase') ?? null;
+    this.refreshRenderRace();
+    const w = safeParse(db.get('wall'));
+    this.wall = { scene: 'off', at: 0, gap: clampGap(Number(w?.gap ?? 40)), order: Array.isArray(w?.order) ? (w!.order as unknown[]).map(String).slice(0, 32) : [] };
+    const ns = safeParse(db.get('nightShift'));
+    this.night = {
+      queue: Array.isArray(ns?.queue) ? (ns!.queue as NightItem[]).map((q) => (q.status === 'running' ? { ...q, status: 'waiting' as const } : q)) : [],
+      armed: ns?.armed === true,
+      allowUnknown: ns?.allowUnknown === true,
+      running: null,
+    };
     this.restoreJobs();
     models.onChange = () => {
       this.broadcastNodes({ type: 'models', models: this.models.info() });
@@ -236,6 +298,8 @@ export class Hub {
       itemsSession: existing?.itemsSession ?? 0,
       ip,
       host,
+      screen: existing?.screen ?? null,
+      clock: null,
     };
     this.nodes.set(id, node);
     this.db.q.upsertNode.run(id, name, caps.deviceType, caps.browser, JSON.stringify(caps), now, now);
@@ -267,7 +331,7 @@ export class Hub {
       case 'want': {
         const pool: Pool = msg.pool === 'llm' ? 'llm' : 'cpu';
         node.credits[pool] = Math.max(0, Math.min(16, node.credits[pool] + Math.max(0, Math.floor(Number(msg.slots) || 0))));
-        node.kernels[pool] = (Array.isArray(msg.kernels) ? msg.kernels : []).filter((k): k is Kernel => ['classify', 'pi', 'sir', 'tutor'].includes(k));
+        node.kernels[pool] = (Array.isArray(msg.kernels) ? msg.kernels : []).filter((k): k is Kernel => (KERNELS as readonly string[]).includes(k));
         this.pump();
         break;
       }
@@ -297,6 +361,19 @@ export class Hub {
         break;
       case 'ping':
         break;
+      case 'clock':
+        send(node.ws, { type: 'clock', id: Number(msg.id) || 0, hub: Date.now() });
+        break;
+      case 'screen': {
+        const sc = msg.screen;
+        const okNum = (v: unknown, lo: number, hi: number) => Number.isFinite(Number(v)) && Number(v) >= lo && Number(v) <= hi;
+        if (sc && okNum(sc.w, 100, 10000) && okNum(sc.h, 100, 10000)) node.screen = { w: Math.round(sc.w), h: Math.round(sc.h), dpr: okNum(sc.dpr, 0.5, 8) ? Number(sc.dpr) : 1 };
+        node.clock = msg.clock && okNum(msg.clock.rtt, 0, 60000) && Number.isFinite(Number(msg.clock.offset)) ? { offset: Math.round(Number(msg.clock.offset)), rtt: Math.round(Number(msg.clock.rtt)) } : node.clock;
+        if (!node.host && !this.wall.order.includes(node.id)) this.wall.order.push(node.id);
+        this.sendWall();
+        this.dirty = true;
+        break;
+      }
     }
   }
 
@@ -306,6 +383,7 @@ export class Hub {
     this.sched.releaseNode(node.id);
     if (this.fed.dropNode(node.id)) this.finishFedRound();
     this.pump();
+    if (this.wall.scene !== 'off') this.sendWall();
     this.dirty = true;
   }
 
@@ -320,6 +398,7 @@ export class Hub {
       } catch {
         return;
       }
+      if (msg?.cmd === 'render-sync') return this.renderSync(ws);
       if (!c.canControl) {
         send(ws, { type: 'toast', level: 'warn', text: 'This screen is view-only. Open the Console link printed in the Hub window to control the lab.' });
         return;
@@ -375,7 +454,232 @@ export class Hub {
       this.dirty = true;
       this.progressToNodes(now);
     } else if (this.run && this.run.finishedAt && now - this.run.finishedAt < 1000) this.progressToNodes(now);
+    this.renderToConsoles();
+    if (this.captions.on || this.captions.orderer.pending) this.releaseCaptions(this.captions.orderer.release(now));
+    this.nightTick();
     if (this.dirty || now % 2000 < 500) this.broadcastConsoles();
+  }
+
+  // ---------- Swarm Render ----------
+
+  private renderToConsoles(reset = this.renderReset) {
+    const tiles = this.render.takeFresh();
+    if (!tiles.length && !reset && !this.renderHeaderChanged) return;
+    this.renderReset = false;
+    this.renderHeaderChanged = false;
+    const msg: RenderTilesMsg = { type: 'render-tiles', header: this.render.header(), tiles, reset };
+    for (const c of this.consoles) send(c.ws, msg);
+  }
+
+  private renderSync(ws: WebSocket) {
+    const msg: RenderTilesMsg = { type: 'render-tiles', header: this.render.header(), tiles: this.render.all(), reset: true };
+    send(ws, msg);
+  }
+
+  // ---------- Screen Wall ----------
+
+  /** Devices on the wall, left to right: online, not the Hub's own hidden node, screen size known. */
+  wallDevices() {
+    const on = (id: string) => {
+      const n = this.nodes.get(id);
+      return !!(n && n.ws && !n.host && n.screen);
+    };
+    return this.wall.order.filter(on).map((id) => this.nodes.get(id)!);
+  }
+
+  wallImageUrl() {
+    return `/api/render/wall.png?v=${this.render.finishedAt ?? 0}`;
+  }
+
+  sendWall() {
+    const devs = this.wallDevices();
+    const { canvas, slots } = wallLayout(
+      devs.map((n) => ({ id: n.id, w: n.screen!.w, h: n.screen!.h })),
+      this.wall.gap,
+    );
+    for (const n of this.nodes.values()) {
+      if (!n.ws || n.host) continue;
+      const k = devs.indexOf(n);
+      const msg: WallMsg = {
+        type: 'wall',
+        scene: k < 0 ? 'off' : this.wall.scene,
+        at: this.wall.at,
+        slot: k < 0 ? null : slots.get(n.id)!,
+        canvas,
+        index: Math.max(0, k),
+        count: devs.length,
+        image: this.wallImageUrl(),
+        name: n.name,
+      };
+      send(n.ws, msg);
+    }
+  }
+
+  private saveWall() {
+    this.db.set('wall', JSON.stringify({ gap: this.wall.gap, order: this.wall.order }));
+  }
+
+  // ---------- Live Captions ----------
+
+  private captionAudio(pcmB64: string, sampleRate: number) {
+    const cap = this.captions;
+    if (!cap.on) return;
+    if (typeof pcmB64 !== 'string' || pcmB64.length > 16000 * 2 * 8 * 1.4) throw new Error('Audio piece too long (max 8 s).');
+    if (sampleRate !== 16000) throw new Error('Audio must be 16 kHz.');
+    const bytes = Math.floor((pcmB64.length * 3) / 4);
+    const audioSec = Math.round((bytes / 2 / 16000) * 100) / 100;
+    if (audioSec < 0.2) return;
+    const seq = cap.seq++;
+    const now = Date.now();
+    cap.orderer.add(seq, now, audioSec);
+    cap.heard += audioSec;
+    const id = `cap-${now.toString(36)}-${seq}`;
+    cap.jobs.set(id, { seq });
+    // One audio piece = one tiny job. Nothing is written to disk; the audio is dropped when the job ends.
+    this.sched.createJob({ id, kernel: 'caption', params: { pcm: pcmB64, sampleRate: 16000, translate: cap.translate, seq }, total: 1, chunk: { initial: 1, min: 1, max: 1, targetSec: 4, guessSecPerItem: 6 }, spotCheck: false });
+    this.pump();
+    this.dirty = true;
+  }
+
+  /** Latest Swarm Render experiment with a 1-device row and a bigger row: 1 device vs the full swarm. */
+  refreshRenderRace() {
+    const rows = (this.db.q.allSpeedup.all() as { experiment: string; lab: string; devices: number; seconds: number }[]).filter((r) => r.lab === 'render');
+    const byEx = new Map<string, { devices: number; seconds: number }[]>();
+    for (const r of rows) byEx.set(r.experiment, [...(byEx.get(r.experiment) ?? []), { devices: r.devices, seconds: r.seconds }]);
+    this.renderRace = null;
+    for (const [experiment, rs] of byEx) {
+      const one = rs.find((r) => r.devices === 1);
+      const all = rs.reduce((a, b) => (b.devices > a.devices ? b : a), rs[0]);
+      if (one && all.devices > 1) this.renderRace = { experiment, rows: [one, all] };
+    }
+    this.dirty = true;
+  }
+
+  private captionDone(job: Job) {
+    const cap = this.captions;
+    const meta = cap.jobs.get(job.id);
+    cap.jobs.delete(job.id);
+    const r = job.results[0] as CaptionOutput | undefined;
+    const by = job.doneBy[0];
+    this.sched.removeJob(job.id);
+    if (!meta) return;
+    if (r && by) cap.devices.add(this.nameOf(by));
+    this.releaseCaptions(cap.orderer.complete(meta.seq, r ? { en: String(r.en ?? ''), es: r.es == null ? null : String(r.es), node: by ? this.nameOf(by) : '' } : null, Date.now()));
+  }
+
+  private releaseCaptions(lines: CaptionLine[]) {
+    if (!lines.length) return;
+    const cap = this.captions;
+    for (const l of lines) {
+      cap.lines.push(l);
+      cap.lags.push(l.lagSec);
+      cap.timing.push({ seq: l.seq, audioSec: l.audioSec, lagSec: l.lagSec, node: l.node, translated: l.es != null && l.es !== '' });
+    }
+    if (cap.timing.length > 5000) cap.timing.splice(0, cap.timing.length - 5000);
+    if (cap.lines.length > 40) cap.lines.splice(0, cap.lines.length - 40);
+    if (cap.lags.length > 10) cap.lags.splice(0, cap.lags.length - 10);
+    this.dirty = true;
+  }
+
+  private stopCaptions() {
+    const cap = this.captions;
+    cap.on = false;
+    for (const id of cap.jobs.keys()) {
+      this.sched.cancelJob(id);
+      this.sched.removeJob(id);
+    }
+    cap.jobs.clear();
+    cap.orderer.reset();
+    cap.seq = 0;
+  }
+
+  // ---------- Night Shift ----------
+
+  /** Devices that may do Night Shift work right now. */
+  nightEligible() {
+    return [...this.nodes.values()]
+      .filter((n) => n.ws && (n.status.state === 'idle' || n.status.state === 'working') && (n.status.battery === 'charging' || (n.status.battery === 'unknown' && this.night.allowUnknown)))
+      .map((n) => n.id);
+  }
+
+  private saveNight() {
+    this.db.set('nightShift', JSON.stringify({ queue: this.night.queue.slice(-50), armed: this.night.armed, allowUnknown: this.night.allowUnknown }));
+  }
+
+  private nightTick() {
+    const ns = this.night;
+    if (ns.running) {
+      const item = ns.queue.find((q) => q.id === ns.running!.id);
+      if (!this.run || this.run.jobId !== ns.running.jobId || this.run.status === 'cancelled') {
+        if (item && item.status === 'running') item.status = 'cancelled';
+        ns.running = null;
+        this.saveNight();
+        this.dirty = true;
+      }
+      return;
+    }
+    if (!ns.armed) return;
+    if (this.run?.status === 'running' || this.experiment?.status === 'running' || this.experiment?.status === 'preparing' || this.captions.on) return;
+    const next = ns.queue.find((q) => q.status === 'waiting');
+    if (!next) return;
+    const eligible = this.nightEligible().filter((id) => this.nodes.get(id)!.status.state === 'idle');
+    if (!eligible.length) return;
+    try {
+      const jobId = this.startLab(next.lab, next.options, { eligible, tag: `night:${next.id}` });
+      if (!jobId) return;
+      next.status = 'running';
+      ns.running = { id: next.id, jobId };
+      this.say('info', `Night Shift: started "${next.title}" on ${eligible.length} charging device${eligible.length === 1 ? '' : 's'}.`);
+    } catch (e) {
+      next.status = 'cancelled';
+      this.say('warn', `Night Shift: could not start "${next.title}": ${e instanceof Error ? e.message : String(e)}`);
+    }
+    this.saveNight();
+    this.dirty = true;
+  }
+
+  private nightDone(job: Job, seconds: number) {
+    const ns = this.night;
+    if (!ns.running || ns.running.jobId !== job.id) return;
+    const item = ns.queue.find((q) => q.id === ns.running!.id);
+    if (item) {
+      item.status = job.status === 'done' ? 'done' : 'cancelled';
+      item.finishedAt = Date.now();
+      item.seconds = round(seconds, 1);
+    }
+    ns.running = null;
+    this.saveNight();
+  }
+
+  // ---------- fleet calculator inputs (measured only) ----------
+
+  fleetInputs(): FleetInputs {
+    const bench = this.db.q.allBench.all() as { test: string; value: number; unit: string; device: string; at?: number; created_at?: number }[];
+    const best = new Map<string, FleetInputs['perDevice'][number]>();
+    const want: Record<string, { kernel: string; label: string; unit: string }> = {
+      'classify mobilenetv3': { kernel: 'classify', label: 'Image sorting', unit: 'images/s' },
+      'render tiles': { kernel: 'render', label: 'Rendering', unit: 'Mrays/s' },
+    };
+    for (const b of bench) {
+      const w = want[b.test];
+      if (!w || !(b.value > 0)) continue;
+      // keep the slowest measured device as the per-device rate (old devices set the honest pace)
+      const cur = best.get(w.kernel);
+      if (!cur || b.value < cur.rate) best.set(w.kernel, { ...w, rate: b.value, device: b.device, source: `Benchmarks: ${b.test} on ${b.device}` });
+    }
+    // runs measured on the Swarm Sort lab count too (1-device baseline)
+    const base = Number(this.db.get('baseline:classify')) || 0;
+    if (!best.has('classify') && base > 0) best.set('classify', { kernel: 'classify', label: 'Image sorting', unit: 'images/s', rate: round(base, 2), device: 'one device', source: 'Swarm Sort run on one device' });
+    const sp = this.db.q.allSpeedup.all() as { experiment: string; lab: string; devices: number; speedup: number }[];
+    let efficiency: FleetInputs['efficiency'] = null;
+    const multi = sp.filter((r) => r.devices >= 2 && r.speedup > 0);
+    if (multi.length) {
+      const last = multi[multi.length - 1];
+      efficiency = { value: round(Math.min(1, last.speedup / last.devices), 3), devices: last.devices, source: `Speedup experiment (${last.lab}): ${last.speedup}× on ${last.devices} devices` };
+    }
+    let captionRtf: FleetInputs['captionRtf'] = null;
+    for (const b of bench) if (b.test === 'captions whisper-tiny-en' && b.value > 0 && (!captionRtf || b.value < captionRtf.value)) captionRtf = { value: b.value, device: b.device, source: `Benchmarks: captions speed on ${b.device}` };
+    return { perDevice: [...best.values()], efficiency, captionRtf };
   }
 
   private progressToNodes(now: number) {
@@ -399,6 +703,21 @@ export class Hub {
 
   private onItems(job: Job, items: { i: number; output: unknown; nodeId: string }[], ms: number) {
     const now = Date.now();
+    if (job.kernel === 'caption') {
+      for (const it of items) {
+        const node = this.nodes.get(it.nodeId);
+        if (node) node.itemsSession++;
+      }
+      return; // captions are never written to disk
+    }
+    if (job.kernel === 'render')
+      for (const it of items) {
+        const out = it.output as Partial<RenderOutput>;
+        if (out && typeof out.rgb === 'string') {
+          this.render.put(job.id, it.i, out as RenderOutput, it.nodeId, now);
+          delete out.rgb; // the pixels live in the framebuffer; the database keeps who/where/checksum
+        }
+      }
     this.db.tx(() => {
       for (const it of items) this.db.q.insertResult.run(job.id, it.i, it.nodeId, JSON.stringify(it.output), now);
       const byNode = new Map<string, number>();
@@ -413,7 +732,20 @@ export class Hub {
   }
 
   private onJobDone(job: Job) {
+    if (job.kernel === 'caption') return this.captionDone(job);
     const now = Date.now();
+    if (job.kernel === 'render' && job.id === this.render.jobId) {
+      void this.render.finish(job.finishedAt ?? now).then(
+        () => {
+          // Header-only update (finished, PNG saved). Not a reset: a reset that carries the
+          // last fresh tiles would make Consoles clear the picture down to those tiles.
+          this.renderHeaderChanged = true;
+          if (this.wall.scene !== 'off') this.sendWall();
+          this.dirty = true;
+        },
+        (e) => this.say('warn', `Could not save the render: ${e instanceof Error ? e.message : String(e)}`),
+      );
+    }
     const run = this.run?.jobId === job.id ? this.run : null;
     const seconds = ((job.finishedAt ?? now) - job.createdAt) / 1000;
     const devices = new Set(job.doneBy.filter(Boolean)).size;
@@ -422,10 +754,11 @@ export class Hub {
       run.status = 'done';
       run.finishedAt = job.finishedAt ?? now;
       const solo = run.soloRate();
-      if (solo && !this.experiment) this.db.set(`baseline:${job.kernel}`, String(solo));
+      if (solo && !this.experiment) this.db.set(baselineKey(job.kernel, job.params), String(solo));
       this.say('info', `${run.def.title}: finished in ${seconds.toFixed(1)} s on ${devices} device${devices === 1 ? '' : 's'}.`);
     }
     if (this.experiment?.status === 'running') this.experimentStepDone(job, seconds);
+    this.nightDone(job, seconds);
     this.dirty = true;
   }
 
@@ -435,6 +768,13 @@ export class Hub {
     if (lab === 'teach') {
       this.cancelRun();
       this.lab = 'teach';
+      this.broadcastNodes(this.labMsg());
+      return null;
+    }
+    if (lab === 'captions') {
+      this.cancelRun();
+      this.lab = 'captions';
+      this.setCaptions(true, options.translate === undefined ? this.captions.translate : !!options.translate);
       this.broadcastNodes(this.labMsg());
       return null;
     }
@@ -449,15 +789,46 @@ export class Hub {
       // Ask devices that haven't loaded the tutor yet to load it.
       for (const node of this.nodes.values()) if (node.ws && node.status.ready.tutor !== model) send(node.ws, { type: 'cmd', cmd: 'prepare', args: { tutor: model } });
     }
+    if (lab === 'translate') {
+      this.requireModel('opus-mt-en-es');
+      for (const node of this.nodes.values()) if (node.ws && !node.host && !node.status.ready.mt) send(node.ws, { type: 'cmd', cmd: 'prepare', args: { speech: { mt: true } } });
+    }
     this.cancelRun();
     const id = `${lab}-${Date.now().toString(36)}`;
     this.db.q.insertJob.run(id, lab, def.kernel, JSON.stringify(def.params), def.total, 'running', Date.now(), extra.tag ?? null);
     this.sched.createJob({ id, kernel: def.kernel, params: def.params, total: def.total, chunk: def.chunk, spotCheck: def.spotCheck, eligible: extra.eligible ?? null });
     this.run = new RunTracker(id, lab, def, Date.now());
     this.lab = lab;
+    if (def.kernel === 'render') {
+      this.render.begin(id, def.params as unknown as RenderParams, Date.now());
+      this.renderReset = true;
+    }
     this.broadcastNodes(this.labMsg());
     this.pump();
     return id;
+  }
+
+  private requireModel(id: string) {
+    const m = this.models.info().find((x) => x.id === id);
+    if (!m?.ready) throw new Error(`The ${m?.title ?? id} model is not on the Hub yet. Connect the Hub to the internet once so it can download it (see Models).`);
+  }
+
+  setCaptions(on: boolean, translate: boolean) {
+    if (on) {
+      this.requireModel('whisper-tiny-en');
+      if (translate) this.requireModel('opus-mt-en-es');
+    }
+    const cap = this.captions;
+    if (!on) this.stopCaptions();
+    else if (!cap.on) {
+      cap.orderer.reset();
+      cap.seq = 0;
+    }
+    cap.on = on;
+    cap.translate = translate;
+    if (on)
+      for (const node of this.nodes.values())
+        if (node.ws && !node.host && (!node.status.ready.asr || (translate && !node.status.ready.mt))) send(node.ws, { type: 'cmd', cmd: 'prepare', args: { speech: { asr: true, mt: translate } } });
   }
 
   cancelRun() {
@@ -472,6 +843,11 @@ export class Hub {
 
   private restoreJobs() {
     for (const row of this.db.q.runningJobs.all() as { id: string; lab: LabId; kernel: string; params: string; total: number }[]) {
+      if (row.kernel === 'render' || row.kernel === 'translate') {
+        // the picture / pasted text only lived in memory: start again rather than resume
+        this.db.q.finishJob.run('cancelled', Date.now(), null, row.id);
+        continue;
+      }
       try {
         const done = new Map<number, { output: unknown; nodeId: string }>();
         for (const r of this.db.q.resultsOf.all(row.id) as { item: number; node_id: string; output: string }[]) done.set(r.item, { output: JSON.parse(r.output), nodeId: r.node_id });
@@ -537,11 +913,13 @@ export class Hub {
 
   // ---------- speedup experiment ----------
 
-  private startExperiment(lab: LabId, items: number, order: string[]) {
+  private startExperiment(lab: LabId, items: number, order: string[], race = false, options: Record<string, unknown> = {}) {
     if (this.experiment?.status === 'running' || this.experiment?.status === 'preparing') throw new Error('An experiment is already running.');
     const ids = order.filter((id) => this.nodes.get(id)?.ws);
     if (!ids.length) throw new Error('Pick at least one connected device.');
-    this.experiment = { id: `exp-${Date.now().toString(36)}`, lab, items, order: ids, step: 0, status: 'running', rows: [] };
+    if (race && ids.length < 2) throw new Error('"1 device vs all" needs at least two connected devices.');
+    if (lab === 'render') items = labJob('render', options, this.info.datasetCount).total;
+    this.experiment = { id: `exp-${Date.now().toString(36)}`, lab, items, order: ids, step: 0, status: 'running', rows: [], race, options };
     if (lab === 'swarm-sort') {
       // Warm up first: every device loads the image model and saves the photos, so step 1 isn't
       // slowed by downloads the later steps don't have. Starts when all are ready (or after 4 min).
@@ -577,23 +955,33 @@ export class Hub {
   private experimentNext() {
     const ex = this.experiment!;
     ex.step++;
-    const eligible = ex.order.slice(0, ex.step);
-    const opts = ex.lab === 'sweep' ? { kind: 'pi', batches: ex.items } : { count: ex.items };
+    const eligible = this.experimentDevices(ex);
+    const opts = ex.lab === 'sweep' ? { kind: 'pi', batches: ex.items } : ex.lab === 'render' ? { res: ex.options.res, spp: ex.options.spp } : { count: ex.items };
     this.startLab(ex.lab, opts, { eligible, tag: `${ex.id}:${ex.step}` });
   }
 
   private experimentStepDone(job: Job, seconds: number) {
     const ex = this.experiment!;
     if (!job.eligible) return;
-    const names = ex.order.slice(0, ex.step).map((id) => this.nameOf(id));
+    const names = this.experimentDevices(ex).map((id) => this.nameOf(id));
     const t1 = ex.rows[0]?.seconds ?? seconds;
-    const row = { devices: ex.step, names, seconds: round(seconds, 2), itemsPerSec: round(job.doneCount / seconds, 2), speedup: round(t1 / seconds, 2) };
+    const row = { devices: names.length, names, seconds: round(seconds, 2), itemsPerSec: round(job.doneCount / seconds, 2), speedup: round(t1 / seconds, 2) };
     ex.rows.push(row);
     this.db.q.insertSpeedup.run(ex.id, Date.now(), job.id, ex.lab, row.devices, names.join(' + '), job.doneCount, row.seconds, row.itemsPerSec, row.speedup);
-    if (ex.step >= ex.order.length) {
+    if (ex.lab === 'render') this.refreshRenderRace();
+    if (ex.step >= this.experimentSteps(ex)) {
       ex.status = 'done';
       this.say('info', 'Speedup experiment finished. Download the CSV from the Benchmarks tab.');
     } else ex.timer = setTimeout(() => ex.status === 'running' && this.experimentNext(), 2000);
+  }
+
+  private experimentDevices(ex: Experiment) {
+    if (ex.race) return ex.step <= 1 ? ex.order.slice(0, 1) : ex.order;
+    return ex.order.slice(0, ex.step);
+  }
+
+  private experimentSteps(ex: Experiment) {
+    return ex.race ? 2 : ex.order.length;
   }
 
   // ---------- console ----------
@@ -613,6 +1001,16 @@ export class Hub {
         break;
       case 'reset':
         this.cancelRun();
+        this.stopCaptions();
+        this.captions.lines = [];
+        this.captions.timing = [];
+        this.captions.lags = [];
+        this.captions.heard = 0;
+        this.captions.devices.clear();
+        if (this.wall.scene !== 'off') {
+          this.wall.scene = 'off';
+          this.sendWall();
+        }
         if (this.experiment) {
           if (this.experiment.timer) clearTimeout(this.experiment.timer);
           this.experiment = null;
@@ -684,6 +1082,60 @@ export class Hub {
       case 'experiment':
         this.startExperiment(msg.lab, Math.max(10, Math.min(5000, Math.round(Number(msg.items) || 200))), (msg.order ?? []).map(String));
         break;
+      case 'race': {
+        const others = [...this.nodes.values()].filter((n) => n.ws && n.id !== msg.first && ['idle', 'working'].includes(n.status.state)).map((n) => n.id);
+        this.startExperiment('render', 0, [String(msg.first), ...others], true, msg.options ?? {});
+        break;
+      }
+      case 'usecase':
+        this.usecase = msg.id ? String(msg.id).slice(0, 40) : null;
+        this.db.set('usecase', this.usecase ?? '');
+        break;
+      case 'render-sync':
+        break; // handled per console in attachConsole
+      case 'wall': {
+        if (Array.isArray(msg.order)) {
+          const ids = msg.order.map(String).filter((id) => this.nodes.has(id));
+          this.wall.order = [...ids, ...this.wall.order.filter((id) => !ids.includes(id))];
+        }
+        if (msg.gap !== undefined) this.wall.gap = clampGap(Number(msg.gap));
+        if (msg.scene && ['off', 'black', 'wake', 'image', 'sweep', 'show'].includes(msg.scene)) {
+          this.wall.scene = msg.scene;
+          this.wall.at = Date.now() + 800; // a little lead time so every screen starts together
+        }
+        this.saveWall();
+        this.sendWall();
+        break;
+      }
+      case 'captions':
+        if (msg.on && this.lab !== 'captions') this.startLab('captions', { translate: msg.translate });
+        else this.setCaptions(!!msg.on, msg.translate === undefined ? this.captions.translate : !!msg.translate);
+        break;
+      case 'caption-audio':
+        this.captionAudio(msg.pcm, Number(msg.sampleRate));
+        break;
+      case 'captions-clear':
+        this.captions.lines = [];
+        this.captions.timing = [];
+        this.captions.lags = [];
+        this.captions.heard = 0;
+        this.captions.devices.clear();
+        break;
+      case 'night': {
+        const ns = this.night;
+        if (msg.action === 'add' && msg.lab) {
+          if (!['swarm-sort', 'sweep', 'render', 'tutor', 'translate'].includes(msg.lab)) throw new Error('That Lab cannot run on the Night Shift.');
+          const def = labJob(msg.lab, msg.options ?? {}, this.info.datasetCount); // validates the options now
+          ns.queue.push({ id: crypto.randomBytes(4).toString('hex'), lab: msg.lab, title: `${LAB_TITLES[msg.lab] ?? msg.lab}: ${def.title}`, options: msg.options ?? {}, status: 'waiting', addedAt: Date.now(), finishedAt: null, seconds: null });
+        }
+        if (msg.action === 'remove') ns.queue = ns.queue.filter((q) => q.id !== msg.id || q.status === 'running');
+        if (msg.action === 'arm') ns.armed = true;
+        if (msg.action === 'disarm') ns.armed = false;
+        if (msg.action === 'clear-done') ns.queue = ns.queue.filter((q) => q.status === 'waiting' || q.status === 'running');
+        if (msg.action === 'allow-unknown') ns.allowUnknown = !!msg.on;
+        this.saveNight();
+        break;
+      }
       case 'host-compute':
         this.hostCompute = { on: !!msg.on, workers: msg.workers === undefined ? this.hostCompute.workers : this.clampHostWorkers(Number(msg.workers) || this.defaultHostWorkers()) };
         this.db.set('hostCompute', JSON.stringify(this.hostCompute));
@@ -706,7 +1158,10 @@ export class Hub {
         break;
       case 'clear':
         if (msg.what === 'bench') this.db.q.clearBench.run();
-        if (msg.what === 'speedup') this.db.q.clearSpeedup.run();
+        if (msg.what === 'speedup') {
+          this.db.q.clearSpeedup.run();
+          this.refreshRenderRace();
+        }
         if (msg.what === 'history') {
           // "Start fresh" after practice: impact counters, job history and offline devices go; measurements stay.
           this.onConsoleCmd({ cmd: 'reset' });
@@ -801,7 +1256,7 @@ export class Hub {
       ...w,
       name: w.device === 'hub' ? 'Hub computer' : (names.get(w.device) ?? w.device),
     }));
-    const baseline = this.run ? Number(this.db.get(`baseline:${this.run.def.kernel}`)) || null : null;
+    const baseline = this.run ? Number(this.db.get(baselineKey(this.run.def.kernel, this.run.def.params))) || null : null;
     const ex = this.experiment;
     const photos = [0, 0, 0];
     for (const n of this.nodes.values()) if (n.ws) n.status.fedPhotos.forEach((v, k) => (photos[k] = (photos[k] ?? 0) + v));
@@ -821,7 +1276,7 @@ export class Hub {
       lab: this.lab,
       run: this.run ? this.run.view(now, this.sched.progress(this.run.jobId), (id) => this.nameOf(id), baseline, this.wattsMap()) : null,
       experiment: ex
-        ? { id: ex.id, lab: ex.lab, items: ex.items, order: ex.order.map((id) => this.nameOf(id)), step: ex.step, steps: ex.order.length, status: ex.status, rows: ex.rows }
+        ? { id: ex.id, lab: ex.lab, items: ex.items, order: ex.order.map((id) => this.nameOf(id)), step: ex.step, steps: this.experimentSteps(ex), status: ex.status, rows: ex.rows, race: ex.race }
         : null,
       fed: {
         sessionId: this.fed.id,
@@ -849,6 +1304,31 @@ export class Hub {
       }),
       datasetCount: this.info.datasetCount,
       tutorQuestions: DEFAULT_QUESTIONS,
+      usecase: this.usecase,
+      wall: {
+        scene: this.wall.scene,
+        at: this.wall.at,
+        gap: this.wall.gap,
+        order: this.wallDevices().map((n) => n.id),
+        devices: [...this.nodes.values()]
+          .filter((n) => !n.host && n.ws)
+          .map((n) => ({ id: n.id, name: n.name, screen: n.screen, clock: n.clock, online: !!n.ws })),
+        image: this.wallImageUrl(),
+      },
+      captions: {
+        on: this.captions.on,
+        translate: this.captions.translate,
+        lines: this.captions.lines.slice(-12),
+        pending: this.captions.orderer.pending,
+        lagSec: median(this.captions.lags),
+        audioSecondsHeard: round(this.captions.heard, 1),
+        audioSecondsSaved: 0,
+        devices: [...this.captions.devices],
+        timedLines: this.captions.timing.length,
+      },
+      renderRace: this.renderRace,
+      nightShift: { queue: this.night.queue, armed: this.night.armed, eligible: this.nightEligible().map((id) => this.nameOf(id)), allowUnknownBattery: this.night.allowUnknown },
+      fleet: this.fleetInputs(),
     };
   }
 }
@@ -870,6 +1350,22 @@ function safeParse(v: string | null | undefined): Record<string, unknown> | null
   } catch {
     return null;
   }
+}
+
+function clampGap(v: number) {
+  return Number.isFinite(v) ? Math.max(0, Math.min(400, Math.round(v))) : 40;
+}
+
+function median(a: number[]) {
+  if (!a.length) return null;
+  const s = [...a].sort((x, y) => x - y);
+  const m = s.length >> 1;
+  return round(s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2, 1);
+}
+
+/** 1-device baselines are only comparable for the same work: renders depend on size and quality. */
+function baselineKey(kernel: string, params: Record<string, unknown>) {
+  return kernel === 'render' ? `baseline:render:${params.width}x${params.height}@${params.spp}` : `baseline:${kernel}`;
 }
 
 function newRoom() {
@@ -898,7 +1394,7 @@ function sanitizeCaps(c: Partial<Capabilities> | undefined): Capabilities {
 }
 
 function sanitizeStatus(st: Partial<NodeStatus> | undefined): NodeStatus {
-  const states = ['idle', 'working', 'paused-unplugged', 'stopped', 'hidden', 'preparing'];
+  const states = ['idle', 'working', 'paused-unplugged', 'paused-input', 'stopped', 'hidden', 'preparing'];
   const batt = ['charging', 'on-battery', 'unknown'];
   return {
     state: (states.includes(String(st?.state)) ? st!.state : 'idle') as NodeStatus['state'],
@@ -910,6 +1406,8 @@ function sanitizeStatus(st: Partial<NodeStatus> | undefined): NodeStatus {
       mobilenet: !!st?.ready?.mobilenet,
       dataset: Math.max(0, Number(st?.ready?.dataset) || 0),
       tutor: typeof st?.ready?.tutor === 'string' ? st.ready.tutor.slice(0, 40) : null,
+      asr: !!st?.ready?.asr,
+      mt: !!st?.ready?.mt,
     },
     fedPhotos: Array.isArray(st?.fedPhotos) ? st!.fedPhotos.slice(0, 3).map((v) => Math.max(0, Math.min(10000, Number(v) || 0))) : [0, 0, 0],
   };

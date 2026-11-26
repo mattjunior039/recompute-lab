@@ -42,3 +42,20 @@ Also built in: Node.js `node:sqlite` (Node.js license, MIT) for the Hub's databa
 
 ## This project
 Recompute's own code is MIT licensed (see `package.json`).
+
+## Speech models (live captions and English→Spanish)
+The Hub downloads these once from Hugging Face at a pinned revision, checks every file's sha256 (pins are in `hub/src/config.ts`), and serves them over the LAN at `/models/<id>/<file>`.
+
+| Model | Source (pinned revision) | License | Files |
+|---|---|---|---|
+| whisper-tiny-en | [onnx-community/whisper-tiny.en](https://huggingface.co/onnx-community/whisper-tiny.en) @ `794207fec2761281fe63a23a94b7e9f53a4efbc1`, an ONNX export of [openai/whisper-tiny.en](https://huggingface.co/openai/whisper-tiny.en) | Apache-2.0 (model card). The original Whisper code is MIT. | int8 encoder + merged decoder + configs/tokenizer, ≈ 43.5 MB |
+| opus-mt-en-es | [Xenova/opus-mt-en-es](https://huggingface.co/Xenova/opus-mt-en-es) @ `4b002a4c7edd54a7ced58877258b87f7efd3f892`, an ONNX export of [Helsinki-NLP/opus-mt-en-es](https://huggingface.co/Helsinki-NLP/opus-mt-en-es) | CC-BY-4.0. The Helsinki-NLP OPUS-MT-train README releases the trained models under CC-BY 4.0. The HF model card tag says Apache-2.0. We follow the stricter of the two: attribution required. | int8 encoder + merged decoder + configs/tokenizer, ≈ 119.6 MB |
+
+- **Attribution for OPUS-MT:** "Translation: OPUS-MT (Tiedemann & Thottingal, 2020; Helsinki-NLP), CC BY 4.0".
+- **OPUS-MT training data:** the training corpora (OPUS) and Tatoeba data carry their own licenses (for example, Tatoeba-Challenge data is CC-BY-NC-SA 4.0). We redistribute only the trained model, not that data.
+- **Sample clip:** `data/speech/sample-en.wav` was synthesized with macOS text-to-speech (`say -v Samantha`) from our own sentence, stored in `data/speech/sample-en.json`. It contains no recorded voices.
+
+| Library | Version | License | Used for |
+|---|---|---|---|
+| @huggingface/transformers (Transformers.js) | 4.3.2 | Apache-2.0 | Whisper and OPUS-MT in the speech worker |
+| onnxruntime-web (Transformers.js's own copy, served at `/vendor/ort-tjs/`) | 1.31.0-dev.20260914-8d85527a0 | MIT | WASM runtime for the speech models |

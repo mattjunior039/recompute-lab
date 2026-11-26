@@ -11,6 +11,8 @@ export class HubSocket<In, Out> {
   constructor(
     private path: string,
     private handlers: { onOpen?: () => void; onMessage: (m: In) => void; onClose?: (code: number, reason: string) => void },
+    /** Sees every outgoing message as text; returning null stops it from being sent. */
+    private check?: (text: string) => string | null,
   ) {
     this.connect();
   }
@@ -76,7 +78,9 @@ export class HubSocket<In, Out> {
 
   send(m: Out) {
     if (this.ws && this.ws.readyState === 1) {
-      this.ws.send(JSON.stringify(m));
+      const text = this.check ? this.check(JSON.stringify(m)) : JSON.stringify(m);
+      if (text === null) return false;
+      this.ws.send(text);
       return true;
     }
     return false;

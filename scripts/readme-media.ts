@@ -172,6 +172,10 @@ if (tm) {
   await phone.waitForFunction(() => !document.querySelector('button.primary[disabled]') && /tok\/s/.test(document.body.innerText), null, { timeout: 180_000 }).catch(() => {});
   await sleep(1000);
   await shot(phone, 'node-tutor.png', true);
+  // Typing the question paused this device's share of class work; the screenshots don't need to wait 30 s.
+  await phone.evaluate(() => (window as any).__recompute.resumeNow());
+  await phone.getByRole('button', { name: /Compute/ }).first().click().catch(() => {});
+  await phone.evaluate(() => (window as any).__recompute.resumeNow());
 }
 
 // Automated speedup experiment 1 → 4 (Benchmarks tab).
@@ -187,6 +191,81 @@ const exp = con.locator('.card', { hasText: 'Speedup experiment ·' }).first();
 await exp.scrollIntoViewIfNeeded();
 await exp.screenshot({ path: path.join(OUT, 'console-speedup-experiment.png') });
 console.log('  saved console-speedup-experiment.png');
+
+// Swarm Render: one 8K picture, tile by tile, each tile outlined in its device's colour.
+console.log('Swarm Render…');
+await tab('Lab');
+await cmd({ cmd: 'start', lab: 'render', options: { res: '8k', spp: 2 } });
+await until(async () => {
+  const r = (await S()).run;
+  return r?.lab === 'render' && r.status === 'running' && r.done > r.total * 0.4 && r;
+}, 600_000, 'render under way');
+const renderCard = async (name: string) => {
+  // The sticky Console header would otherwise cover the top of the card in an element screenshot.
+  await con.evaluate(() => document.querySelectorAll<HTMLElement>('header').forEach((e) => (e.style.position = 'static')));
+  await con.locator('.render-card').screenshot({ path: path.join(OUT, name) });
+  await con.evaluate(() => document.querySelectorAll<HTMLElement>('header').forEach((e) => (e.style.position = '')));
+  console.log('  saved', name);
+};
+await renderCard('console-swarm-render-running.png');
+await until(async () => {
+  const r = (await S()).run;
+  return r?.lab === 'render' && r.status === 'done';
+}, 900_000, 'render done');
+await sleep(2500);
+await renderCard('console-swarm-render.png');
+
+// Screen Wall: the finished picture spread across every device's screen, in order.
+console.log('Screen Wall…');
+const order = devs.map((d) => d.id);
+await cmd({ cmd: 'wall', order, gap: 40, scene: 'image' });
+await sleep(4000);
+const wallShots: string[] = [];
+for (const [k, d] of devs.entries()) {
+  const f = path.join(vidDir, `wall-${k}.png`);
+  await d.page!.screenshot({ path: f });
+  wallShots.push(f);
+}
+await cmd({ cmd: 'wall', scene: 'off' });
+try {
+  const inputs = wallShots.flatMap((f) => ['-i', f]);
+  const scaled = wallShots.map((_, k) => `[${k}:v]scale=-2:420,pad=iw+24:ih:12:0:color=0x05070d[s${k}]`).join(';');
+  const filter = `${scaled};${wallShots.map((_, k) => `[s${k}]`).join('')}hstack=inputs=${wallShots.length}`;
+  execFileSync('ffmpeg', ['-y', '-loglevel', 'error', ...inputs, '-filter_complex', filter, path.join(OUT, 'screen-wall.png')]);
+  console.log('  saved screen-wall.png');
+} catch (e) {
+  console.log('  wall composite skipped:', e instanceof Error ? e.message : e);
+}
+
+// Live Captions from the bundled synthesized WAV (no recorded voices), with the Spanish line.
+console.log('Live Captions…');
+await cmd({ cmd: 'captions', on: true, translate: true });
+await until(async () => (await S()).nodes.filter((n) => n.online && n.status.ready.asr && n.status.ready.mt).length >= 2, 600_000, 'speech models on devices');
+await cmd({ cmd: 'captions-clear' });
+const wav = fs.readFileSync('data/speech/sample-en.wav');
+let o = 12;
+while (wav.toString('latin1', o, o + 4) !== 'data') o += 8 + wav.readUInt32LE(o + 4);
+const pcm = wav.subarray(o + 8, o + 8 + wav.readUInt32LE(o + 4));
+const piece = 16000 * 2 * 3;
+let seq = 0;
+for (let at = 0; at < pcm.length; at += piece) {
+  const end = pcm.length - (at + piece) < piece / 3 ? pcm.length : at + piece;
+  await cmd({ cmd: 'caption-audio', seq: seq++, pcm: pcm.subarray(at, end).toString('base64'), sampleRate: 16000, endedAt: Date.now() });
+  await sleep(3000);
+  if (end === pcm.length) break;
+}
+await until(async () => {
+  const c = (await S()).captions;
+  return c.lines.length >= seq && c.pending === 0;
+}, 300_000, 'captions back');
+await sleep(1500);
+await shot(con, 'console-captions.png');
+await cmd({ cmd: 'captions', on: false });
+
+// Use cases picker, and the phone's own "What my device did" panel.
+await tab('Use cases');
+await shot(con, 'console-use-cases.png');
+await shot(devs[3].page!, 'node-what-my-device-did.png', true);
 
 await tab('Lab');
 await cmd({ cmd: 'reset' });

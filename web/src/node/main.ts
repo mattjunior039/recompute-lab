@@ -6,12 +6,15 @@ import { h, clear, fmtInt, fmtNum, fmtTime, fmtBytes, toast } from '../shared/do
 import { defaultWorkers, isMobile, probeCaps, deviceType } from '../shared/device';
 import { HubSocket } from '../shared/socket';
 import { fetchCached } from '../shared/filecache';
-import type { BatteryState, Capabilities, HubToNode, Kernel, LabId, LeaseMsg, ModelInfo, NodeState, NodeStatus, NodeToHub } from '../shared/protocol';
+import { HEAVY_KERNELS, type BatteryState, type Capabilities, type HubToNode, type Kernel, type LabId, type LeaseMsg, type ModelInfo, type NodeState, type NodeStatus, type NodeToHub } from '../shared/protocol';
 import { Scheduler } from '../shared/scheduler';
 import { labJob, compareOutputs } from '../../../hub/src/labs';
 import { Engine, imageUrl } from './engine';
 import { Teach } from './teach';
 import { Tutor } from './tutor';
+import { Speech } from './speech';
+import { WallNode } from './wall';
+import { DeviceLog, didPanel } from './did';
 
 const qs = new URLSearchParams(location.search);
 const MODE: 'join' | 'reborn' = qs.get('mode') === 'reborn' ? 'reborn' : 'join';
@@ -65,6 +68,16 @@ let lastKernels = { cpu: '', llm: '' };
 const active = new Map<string, { jobId: string; pool: 'cpu' | 'llm'; kernel: Kernel; n: number; abort?: AbortController }>();
 const cancelledJobs = new Set<string>();
 const completions: { t: number; n: number }[] = [];
+const did = new DeviceLog(() => LS.get('did'), (v) => LS.set('did', v));
+
+// Pause while in use (Join mode): any key, click, touch or mouse movement on this
+// page stops computing at once; it starts again after IDLE_MS without input.
+// Recompute's own controls (Stop, Resume now, launch buttons) don't count as "in use".
+const IDLE_MS = 30_000;
+const CAN_PAUSE_ON_INPUT = MODE === 'join' && !HOST;
+let pauseOnInput = CAN_PAUSE_ON_INPUT && LS.get('pauseOnInput') !== '0';
+let lastInputAt = -Infinity;
+const inputPaused = () => pauseOnInput && performance.now() - lastInputAt < IDLE_MS;
 
 const engine = new Engine(WORKERS, {
   onChange: () => schedule(),
@@ -77,6 +90,11 @@ const tutor = new Tutor(() => {
   schedule();
   topUp();
 });
+const speech = new Speech(() => {
+  schedule();
+  topUp();
+});
+const wall = new WallNode((m) => send(m));
 let teach: Teach;
 let sock: HubSocket<HubToNode, NodeToHub> | null = null;
 
@@ -97,6 +115,8 @@ function nodeState(): NodeState {
   if (stopped) return 'stopped';
   if (document.hidden && isMobile(type)) return 'hidden';
   if (battery === 'on-battery' && !allowBattery) return 'paused-unplugged';
+  // A solo run is work the student started on this device for themselves, so input doesn't pause it.
+  if (inputPaused() && solo?.finished !== null) return 'paused-input';
   if (active.size > 0 || solo?.finished === null) return 'working';
   if (preparing > 0) return 'preparing';
   return 'idle';
@@ -115,9 +135,9 @@ function status(): NodeStatus {
     state: nodeState(),
     battery,
     throttle: engine.throttle,
-    activeWorkers: engine.busy + (tutor.busy ? 1 : 0),
+    activeWorkers: engine.busy + (tutor.busy || speech.busy ? 1 : 0),
     rate: Math.round(rate() * 100) / 100,
-    ready: { mobilenet: engine.modelReady, dataset: imagesCached, tutor: tutor.ready ? tutor.modelId : null },
+    ready: { mobilenet: engine.modelReady, dataset: imagesCached, tutor: tutor.ready ? tutor.modelId : null, asr: speech.ready.asr, mt: speech.ready.mt },
     fedPhotos: teach?.counts ?? [0, 0, 0],
   };
 }
@@ -144,7 +164,7 @@ function sendStatus(force = false) {
 /** Tell the Hub how many more chunks we can take, and which kernels we have ready. */
 function topUp() {
   if (!sock?.open || !welcomed || !canCompute() || solo?.finished === null) return;
-  const cpuKernels: Kernel[] = ['pi', 'sir'];
+  const cpuKernels: Kernel[] = ['render', 'pi', 'sir'];
   if (engine.modelReady) cpuKernels.unshift('classify');
   const runningCpu = [...active.values()].filter((a) => a.pool === 'cpu').length;
   const needCpu = engine.enabled - runningCpu - outstanding.cpu;
@@ -155,9 +175,12 @@ function topUp() {
     outstanding.cpu += n;
     lastKernels.cpu = kc;
   }
-  const llmKernels: Kernel[] = tutor.ready ? ['tutor'] : [];
+  const llmKernels: Kernel[] = [];
+  if (speech.ready.asr) llmKernels.push('caption');
+  if (speech.ready.mt) llmKernels.push('translate');
+  if (tutor.ready) llmKernels.push('tutor');
   const runningLlm = [...active.values()].filter((a) => a.pool === 'llm').length;
-  const needLlm = (tutor.ready && !chatBusy ? 1 : 0) - runningLlm - outstanding.llm;
+  const needLlm = (llmKernels.length && !chatBusy ? 1 : 0) - runningLlm - outstanding.llm;
   const kl = llmKernels.join();
   if (needLlm > 0 || kl !== lastKernels.llm) {
     const n = Math.max(0, needLlm);
@@ -168,7 +191,7 @@ function topUp() {
 }
 
 async function onLease(m: LeaseMsg) {
-  const pool = m.kernel === 'tutor' ? 'llm' : 'cpu';
+  const pool = HEAVY_KERNELS.includes(m.kernel) ? 'llm' : 'cpu';
   outstanding[pool] = Math.max(0, outstanding[pool] - 1);
   if (!canCompute() || cancelledJobs.has(m.jobId)) {
     send({ type: 'release', leaseIds: [m.leaseId] });
@@ -182,7 +205,9 @@ async function onLease(m: LeaseMsg) {
   try {
     let outputs: unknown[];
     let ms: number;
-    if (pool === 'llm') {
+    if (m.kernel === 'caption' || m.kernel === 'translate') {
+      ({ outputs, ms } = await runSpeech(m));
+    } else if (pool === 'llm') {
       const t0 = performance.now();
       const questions = m.params.questions as string[];
       outputs = [];
@@ -204,6 +229,9 @@ async function onLease(m: LeaseMsg) {
       send({ type: 'result', leaseId: m.leaseId, outputs, ms: Math.round(ms) });
       completions.push({ t: performance.now(), n: m.items.length });
       itemsDone += m.items.length;
+      // int16 audio as base64: 4 chars = 3 bytes, 2 bytes per sample at 16 kHz.
+      const audioSec = m.kernel === 'caption' ? (String(m.params.pcm ?? '').length * 3) / 4 / 2 / 16000 : 0;
+      did.work(m.jobId, m.kernel, m.items.length, ms, audioSec);
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -218,6 +246,58 @@ async function onLease(m: LeaseMsg) {
     schedule();
     sendStatus();
   }
+}
+
+/** Captions and translation. The audio arrives in memory, is transcribed, and is dropped. */
+async function runSpeech(m: LeaseMsg): Promise<{ outputs: unknown[]; ms: number }> {
+  const t0 = performance.now();
+  const outputs: unknown[] = [];
+  if (m.kernel === 'caption') {
+    const pcm = int16B64ToF32(String(m.params.pcm ?? ''));
+    const a = await speech.asr(pcm);
+    let es: string | null = null;
+    let mtMs = 0;
+    if (m.params.translate && speech.ready.mt && a.text) {
+      const t = await speech.translate([a.text]);
+      es = t.texts[0] ?? null;
+      mtMs = t.ms;
+    }
+    outputs.push({ en: a.text, es, asrMs: Math.round(a.ms), mtMs: Math.round(mtMs) });
+  } else {
+    const paras = (m.params.paragraphs as string[]) ?? [];
+    for (const i of m.items) {
+      const t = await speech.translate([String(paras[i] ?? '')]);
+      outputs.push({ text: t.texts[0] ?? '', ms: Math.round(t.ms) });
+    }
+  }
+  return { outputs, ms: performance.now() - t0 };
+}
+
+function int16B64ToF32(b: string) {
+  const s = atob(b);
+  const n = s.length >> 1;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const v = s.charCodeAt(2 * i) | (s.charCodeAt(2 * i + 1) << 8);
+    out[i] = (v >= 0x8000 ? v - 0x10000 : v) / 32768;
+  }
+  return out;
+}
+
+async function loadSpeech(want: { asr?: boolean; mt?: boolean }) {
+  const asr = want.asr && !speech.ready.asr ? modelInfo('whisper-tiny-en') : undefined;
+  const mt = want.mt && !speech.ready.mt ? modelInfo('opus-mt-en-es') : undefined;
+  if (!asr?.ready && !mt?.ready) return;
+  const what = asr && mt ? 'captions + Spanish' : asr ? 'captions' : 'Spanish translation';
+  await withPreparing(`Loading the ${what} models…`, () =>
+    speech.load({ asr: asr?.ready ? asr : undefined, mt: mt?.ready ? mt : undefined }, (f) => {
+      preparingText = `Loading the ${what} models… ${Math.round(f * 100)}%`;
+      schedule();
+    }),
+  ).catch((e) => {
+    lastError = `Speech: ${e instanceof Error ? e.message : e}`;
+    toast(lastError, 'warn');
+  });
 }
 
 // ---------- model / data preparation ----------
@@ -333,7 +413,7 @@ function connect() {
       schedule();
     },
     onMessage: (m) => void onMessage(m),
-  });
+  }, (text) => did.checkOutgoing(text));
 }
 
 async function onMessage(m: HubToNode) {
@@ -352,6 +432,7 @@ async function onMessage(m: HubToNode) {
       LS.set('datasetCount', String(datasetCount));
       lastStatusKey = '';
       sendStatus(true);
+      if (!HOST) wall.start();
       topUp();
       if (AUTOLOAD && !engine.modelReady && modelInfo('mobilenetv3')?.ready) ensureModel().catch(() => {});
       schedule();
@@ -382,6 +463,7 @@ async function onMessage(m: HubToNode) {
         if (a.mobilenet || a.all) await ensureModel().catch(() => {});
         if (a.images || a.all) await preloadImages();
         if (typeof a.tutor === 'string') await loadTutor(a.tutor);
+        if (a.speech && typeof a.speech === 'object' && !HOST) await loadSpeech(a.speech as { asr?: boolean; mt?: boolean });
       }
       schedule();
       break;
@@ -412,13 +494,17 @@ async function onMessage(m: HubToNode) {
     case 'fed:reset':
       await teach.onMessage(m);
       break;
+    case 'clock':
+    case 'wall':
+      wall.onMessage(m);
+      break;
   }
 }
 
 function setStopped(v: boolean, why?: string) {
   stopped = v;
   if (v) {
-    engine.cancelQueued();
+    engine.interrupt();
     for (const a of active.values()) a.abort?.abort();
     if (solo) solo.cancel = true;
     if (why) toast(why, 'warn');
@@ -426,6 +512,35 @@ function setStopped(v: boolean, why?: string) {
   sendStatus(true);
   if (!v) topUp();
   void updateWakeLock();
+  schedule();
+}
+
+// ---------- pause while in use ----------
+function onUserInput(e: Event) {
+  if (!pauseOnInput) return;
+  if (e.type === 'pointermove' && (e as PointerEvent).pointerType !== 'mouse') return;
+  if ((e.target as Element | null)?.closest?.('[data-no-pause]')) return;
+  const was = inputPaused();
+  lastInputAt = performance.now();
+  if (was || solo?.finished === null) return;
+  engine.interrupt();
+  for (const a of active.values()) a.abort?.abort();
+  sendStatus(true);
+  schedule();
+}
+if (CAN_PAUSE_ON_INPUT) for (const ev of ['keydown', 'pointerdown', 'pointermove', 'touchstart', 'wheel']) window.addEventListener(ev, onUserInput, { capture: true, passive: true });
+function setPauseOnInput(v: boolean) {
+  pauseOnInput = v;
+  LS.set('pauseOnInput', v ? null : '0');
+  if (!v) lastInputAt = -Infinity;
+  sendStatus(true);
+  topUp();
+  schedule();
+}
+function resumeNow() {
+  lastInputAt = -Infinity;
+  sendStatus(true);
+  topUp();
   schedule();
 }
 
@@ -508,6 +623,7 @@ async function runSolo(labId: 'swarm-sort' | 'sweep', options: Record<string, un
         sched.complete(lease.id, 'me', r.outputs, r.ms);
         s.done += lease.items.length;
         itemsDone += lease.items.length;
+        did.work(`solo-${s.started}`, def.kernel as Kernel, lease.items.length, r.ms);
         completions.push({ t: performance.now(), n: lease.items.length });
         if (def.kernel === 'pi')
           for (const o of r.outputs as { inside: number; samples: number }[]) {
@@ -623,12 +739,11 @@ const els = {
   timer: h('div', { class: 'big hidden' }),
   progBar: h('div', { class: 'bar hidden' }, h('i')),
   progText: h('div', { class: 'muted' }),
-  stop: h('button', { class: 'stop-btn danger' }, 'STOP'),
-  battery: h('span'),
+  stop: h('button', { class: 'stop-btn danger', 'data-no-pause': '' }, 'STOP'),
   workers: h('span'),
   mine: h('span'),
-  launch: h('div', { class: 'col' }),
-  solo: h('div', { class: 'card col hidden' }),
+  launch: h('div', { class: 'col', 'data-no-pause': '' }),
+  solo: h('div', { class: 'card col hidden', 'data-no-pause': '' }),
   tabs: h('div', { class: 'tabs' }),
   pane: h('div'),
   computePane: h('div', { class: 'col' }),
@@ -638,8 +753,24 @@ const els = {
   rebornRate: h('div', { class: 'label' }),
   rebornState: h('div', { class: 'name' }),
   pulse: h('span', { class: 'pulse idle' }),
-  battBtn: h('button', { class: 'small hidden' }, 'Use battery anyway (this session)'),
+  battBtn: h('button', { class: 'small hidden', 'data-no-pause': '' }, 'Use battery anyway (this session)'),
+  powerChip: h('div', { class: 'chip', 'data-no-pause': '' }),
+  powerText: h('span'),
+  pauseChip: h('div', { class: 'chip', 'data-no-pause': '' }),
+  pauseText: h('span'),
+  resumeBtn: h('button', { class: 'small primary hidden', 'data-no-pause': '' }, 'Resume now'),
+  pauseToggle: h('input', { type: 'checkbox' }) as HTMLInputElement,
+  did: h('div'),
 };
+els.powerChip.append(els.powerText, els.battBtn);
+els.pauseChip.append(els.pauseText, els.resumeBtn);
+els.resumeBtn.onclick = () => resumeNow();
+els.pauseToggle.onchange = () => setPauseOnInput(els.pauseToggle.checked);
+els.did.addEventListener('did-reset', () => {
+  lastDidKey = '';
+  schedule();
+});
+let lastDidKey = '';
 els.stop.onclick = () => setStopped(!stopped, stopped ? undefined : 'Stopped. This device is not computing.');
 els.battBtn.onclick = () => {
   allowBattery = true;
@@ -657,15 +788,17 @@ function renderJoin() {
   clear(els.tabs, tabBtn('compute', '⚡ Compute'), tabBtn('teach', '📷 Teach'), tabBtn('tutor', '💬 Tutor'), tabBtn('device', 'ⓘ Device'));
   clear(
     els.computePane,
+    h('div', { class: 'chips' }, els.powerChip, els.pauseChip),
     h('div', { class: 'card node-status' }, els.state, els.sub, els.timer, els.progBar, els.progText),
     els.stop,
     els.launch,
     els.solo,
+    els.did,
     h(
       'div',
       { class: 'card kv' },
-      h('span', { class: 'k' }, 'Power'),
-      h('span', null, els.battery, ' ', els.battBtn),
+      h('span', { class: 'k' }, 'While I use it'),
+      h('label', { class: 'row', style: 'gap:8px', 'data-no-pause': '' }, els.pauseToggle, 'Pause computing while I type, click or touch (starts again after 30 s)'),
       h('span', { class: 'k' }, 'Workers'),
       els.workers,
       h('span', { class: 'k' }, 'This device'),
@@ -690,7 +823,7 @@ function showTab(t: typeof tab) {
 
 function renderReborn() {
   document.body.classList.add('reborn');
-  const stop = h('button', { class: 'danger', style: 'font-size:22px;padding:14px 30px' }, 'STOP');
+  const stop = h('button', { class: 'danger', style: 'font-size:22px;padding:14px 30px', 'data-no-pause': '' }, 'STOP');
   stop.onclick = () => {
     setStopped(!stopped);
     stop.textContent = stopped ? 'RESUME' : 'STOP';
@@ -707,9 +840,11 @@ function renderReborn() {
       els.name,
       els.rebornCount,
       els.rebornRate,
+      h('div', { class: 'chips', style: 'justify-content:center' }, els.powerChip),
       els.conn,
       banners(),
       h('div', { class: 'row', style: 'justify-content:center' }, stop, fs),
+      els.did,
       h('div', { class: 'muted small' }, 'Reborn mode: this device is a compute-only node. Keep it plugged in.'),
     ),
   );
@@ -837,6 +972,14 @@ function renderDevice() {
   );
 }
 
+/** The big power chip: charge-only computing has always been on; this just makes it obvious. */
+function powerChip(st: NodeState): [string, string] {
+  if (battery === 'on-battery' && !allowBattery) return ['warn', '🔋 Paused — unplugged'];
+  if (battery === 'on-battery') return ['warn', st === 'working' ? '🔋 On battery — computing (allowed this session)' : '🔋 On battery (allowed this session)'];
+  if (battery === 'charging') return ['ok', st === 'working' ? '⚡ Charging — computing' : '⚡ Charging — ready to compute'];
+  return ['info', '❔ This browser can’t report charging — please keep it plugged in'];
+}
+
 function batteryText() {
   if (battery === 'charging') return '🔌 Plugged in';
   if (battery === 'on-battery') return allowBattery ? '🔋 On battery (allowed this session)' : '🔋 On battery — paused until plugged in';
@@ -856,6 +999,8 @@ function stateText(): [string, string] {
       return ['Paused', 'Keep this page open on screen to help.'];
     case 'paused-unplugged':
       return ['Paused: plug me in', 'Recompute only computes while charging.'];
+    case 'paused-input':
+      return ['Paused: you’re using this device', `Computing starts again after ${IDLE_MS / 1000} s without typing, clicking or touching.`];
     case 'preparing':
       return ['Getting ready', preparingText];
     case 'working':
@@ -866,7 +1011,7 @@ function stateText(): [string, string] {
 }
 
 function labTitle() {
-  return { 'swarm-sort': 'Swarm Sort', teach: 'Teach the Swarm', tutor: 'Private Tutor', sweep: 'Science Sweep' }[lab.lab ?? 'swarm-sort'] ?? '';
+  return { 'swarm-sort': 'Swarm Sort', teach: 'Teach the Swarm', tutor: 'Private Tutor', sweep: 'Science Sweep', render: 'Swarm Render', captions: 'Live Captions', translate: 'Translate a document' }[lab.lab ?? 'swarm-sort'] ?? '';
 }
 
 function update() {
@@ -881,8 +1026,25 @@ function update() {
   els.sub.textContent = sub;
   els.stop.textContent = stopped ? 'RESUME' : 'STOP';
   els.stop.className = `stop-btn ${stopped ? 'primary' : 'danger'}`;
-  els.battery.textContent = batteryText();
   els.battBtn.classList.toggle('hidden', !(battery === 'on-battery' && !allowBattery));
+  const [pCls, pTxt] = powerChip(st);
+  els.powerChip.className = `chip ${pCls}`;
+  els.powerText.textContent = pTxt;
+  const paused = st === 'paused-input';
+  els.pauseChip.classList.toggle('hidden', !CAN_PAUSE_ON_INPUT);
+  els.pauseChip.className = `chip ${paused ? 'warn' : 'muted'}${CAN_PAUSE_ON_INPUT ? '' : ' hidden'}`;
+  els.pauseText.textContent = paused
+    ? `✋ Paused — you’re using this device · resumes in ${Math.max(1, Math.ceil((IDLE_MS - (performance.now() - lastInputAt)) / 1000))} s`
+    : pauseOnInput
+      ? '✋ Pauses while you use this device'
+      : '✋ Pause-while-in-use is off';
+  els.resumeBtn.classList.toggle('hidden', !paused);
+  els.pauseToggle.checked = pauseOnInput;
+  const didKey = JSON.stringify([did.c, teach?.counts]);
+  if (didKey !== lastDidKey) {
+    lastDidKey = didKey;
+    clear(els.did, didPanel(did, (teach?.counts ?? []).reduce((a, b) => a + b, 0), MODE === 'reborn'));
+  }
   els.workers.textContent = `${engine.busy} busy of ${engine.enabled}${engine.throttle ? ` (cooling: −${engine.throttle})` : ''} · ${engine.modelReady ? `image model ready (${engine.backend})` : 'image model not loaded'}`;
   els.mine.textContent = `${fmtInt(itemsDone)} items computed · ${fmtNum(rate())}/s now`;
   LS.set('itemsDone', String(itemsDone));
@@ -894,7 +1056,7 @@ function update() {
     els.progBar.classList.remove('hidden');
     els.timer.textContent = fmtTime(p!.elapsed);
     (els.progBar.firstChild as HTMLElement).style.width = `${(100 * p!.done) / Math.max(1, p!.total)}%`;
-    els.progText.textContent = `${fmtInt(p!.done)} / ${fmtInt(p!.total)} ${p!.unit} · ${fmtNum(p!.rate)}/s · ${p!.devices} device${p!.devices === 1 ? '' : 's'} · this device did ${fmtInt(p!.mine)}${p!.status === 'done' ? ' · finished!' : ''}`;
+    els.progText.textContent = `${fmtInt(p!.done)} / ${fmtInt(p!.total)} ${p!.unit} · ${fmtNum(p!.rate)}/s${p!.status === 'running' ? ` · ${p!.devices} device${p!.devices === 1 ? '' : 's'}` : ''} · this device did ${fmtInt(p!.mine)}${p!.status === 'done' ? ' · finished!' : ''}`;
   } else if (solo) {
     const el = ((solo.finished ?? performance.now()) - solo.started) / 1000;
     els.timer.classList.remove('hidden');
@@ -967,19 +1129,23 @@ teach = new Teach({
 
 (window as unknown as Record<string, unknown>).__recompute = {
   get state() {
-    return { welcomed, nodeId, name, room, status: status(), outstanding: { ...outstanding }, active: active.size, itemsDone, tutor: { ready: tutor.ready, id: tutor.modelId, tps: tutor.lastTokPerSec } };
+    return { welcomed, nodeId, name, room, status: status(), outstanding: { ...outstanding }, active: active.size, itemsDone, did: did.c, pauseOnInput, tutor: { ready: tutor.ready, id: tutor.modelId, tps: tutor.lastTokPerSec } };
   },
   engine,
   tutor,
   addPhotoFromUrl: (url: string, label: number) => teach.addFromUrl(url, label),
   stop: () => setStopped(true),
   resume: () => setStopped(false),
+  resumeNow,
   loadTutor,
   ask: (q: string, maxTokens = 48) => tutor.ask(q, { maxTokens }),
   runSolo,
   preloadImages,
   get solo() {
     return solo;
+  },
+  get wall() {
+    return { msg: (wall as unknown as { msg: unknown }).msg, offset: wall.offset, rtt: wall.rtt, showing: wall.showing };
   },
 };
 

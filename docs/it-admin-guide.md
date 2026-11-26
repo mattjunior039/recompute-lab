@@ -9,7 +9,7 @@ This page is for school IT staff evaluating or deploying Recompute. In short: Re
 | **Node** | A browser page (`/join`) that runs built-in compute kernels in Web Workers | Connects only to the Hub, over WebSocket (star topology) |
 | **Console** | A browser page (`/console`) on the Hub computer | Same |
 
-- **Outbound internet** is needed only for setup: `npm install` (registry.npmjs.org) and the first model download from **huggingface.co** (about 410 MB, over HTTPS 443). After that the whole lab works with the internet unplugged.
+- **Outbound internet** is needed only for setup: `npm install` (registry.npmjs.org) and the first model download from **huggingface.co** (about 570 MB, over HTTPS 443). After that the whole lab works with the internet unplugged.
 - **No peer-to-peer.** Devices never talk to each other, only to the Hub, so no WebRTC or extra ports are needed.
 - **No analytics or telemetry.** Recompute doesn't contact any third party during lessons.
 
@@ -17,7 +17,7 @@ This page is for school IT staff evaluating or deploying Recompute. In short: Re
 1. **The Hub and student devices must reach each other on the same LAN/SSID.** Many school and guest SSIDs enable *client isolation* (AP isolation), which blocks device-to-device traffic. Either allow traffic from the SSID to the Hub's IP on TCP 8080/8443, or use a dedicated router or SSID for the lab.
 2. **Give the Hub a stable IP** (DHCP reservation). The join QR code contains the Hub's IP address; if it changes, students rescan.
 3. **Hub computer firewall:** allow incoming connections for Node.js on *private* networks (macOS asks the first time; on Windows, allow it on "Private networks" in the Defender Firewall prompt).
-4. **Bandwidth:** on first use, each device downloads the image model (about 21 MB) and the photo set (about 14 MB) from the Hub. Each device that loads the tutor downloads 370–470 MB from the Hub. It's all LAN traffic, and devices cache it in browser storage.
+4. **Bandwidth:** on first use, each device downloads the image model (about 21 MB) and the photo set (about 14 MB) from the Hub. Each device that loads the tutor downloads 370–470 MB from the Hub, and each device that helps with Live Captions downloads about 165 MB of speech models. It's all LAN traffic, and devices cache it in browser storage.
 5. **Web filters / SSL inspection:** traffic stays on the LAN, but if a filtering agent on the Chromebooks proxies all traffic, add the Hub's IP (`http://<hub-ip>:8080` and `https://<hub-ip>:8443`) to its bypass list.
 
 ## Why there's a certificate (and how to push it)
@@ -40,6 +40,7 @@ These are the policies that most often block Recompute on managed devices. Setti
 | Open the Hub's pages | **URL blocking** (`URLBlocklist` / `URLAllowlist`): if you run an allowlist, add `http://<hub-ip>:8080` and `https://<hub-ip>:8443`. |
 | Cache models and photos on the device | **Cookies / site data** (`DefaultCookiesSetting`): if site data is blocked, allow the Hub origin (`CookiesAllowedForUrls`). Otherwise devices re-download models every visit. |
 | Teach the Swarm camera | **Video input** (`VideoCaptureAllowed`, `VideoCaptureAllowedUrls`): allow the Hub's https origin. |
+| Live Captions microphone (only on the computer that runs the Console) | **Audio input** (`AudioCaptureAllowed`, `AudioCaptureAllowedUrls`): allow the Hub's origin if the Console runs on a managed device. |
 | Keep the screen on in Reborn/cart mode | **Screen wake locks** (`AllowScreenWakeLocks`) and the idle/power settings for the cart OU. If wake locks are disabled, the page can't keep the screen awake and the device may sleep mid-job. |
 | Optional: start cart devices straight into Reborn mode | **Pages to load on startup** (`RestoreOnStartupURLs`) set to `https://<hub-ip>:8443/join?mode=reborn&room=…` for a dedicated cart OU. |
 
@@ -50,11 +51,14 @@ WebGPU is optional: Recompute uses WebAssembly first and only uses WebGPU when a
 - Nodes run only **built-in** compute kernels shipped with the app. The Hub never sends code to devices, only data and kernel names.
 - Models are pinned to a fixed version and checked against a SHA-256 hash before they're served; mismatches are rejected.
 - Teach the Swarm photos stay on the device that took them. Only model weights go to the Hub.
+- Live Captions audio is held in memory only, in 2–5 second pieces, and dropped once it has been turned into text. Nothing is recorded or written to disk.
+- Every device shows a **"What my device did"** panel: the jobs it helped with and a privacy block (0 files accessed · 0 accounts touched · 0 photos uploaded · 0 audio saved). Outgoing messages are checked, and anything that looks like a photo or a sound is blocked.
 - The Hub stores jobs, results, benchmark numbers, and (optional) measured watts in a local SQLite file under `.recompute/`. Delete that folder to wipe everything.
 - See also [SECURITY.md](../SECURITY.md) for how to report a vulnerability.
 
 ## Device safety settings built in
 - Each device uses all CPU cores but one.
+- In Join mode (a student's own device), computing stops the moment someone types, clicks, or touches the Recompute page, and starts again after 30 seconds idle. Reborn mode doesn't pause.
 - Devices pause when unplugged, where the browser exposes the Battery API (Chrome/ChromeOS). Safari doesn't, so the page shows the charging state as "unknown" and keeps computing; keep those devices plugged in.
 - If work chunks start taking longer (a sign of heat throttling), the device backs off.
 - Every device has a big **STOP** button, and the Console can stop every job.

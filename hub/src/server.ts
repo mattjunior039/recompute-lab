@@ -2,12 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type http from 'node:http';
 import { WebSocketServer } from 'ws';
-import { DATASET_DIR, DIST_DIR, ROOT, WEB_DIR } from './config';
+import { DATASET_DIR, DIST_DIR, ROOT, SPEECH_DIR, WEB_DIR } from './config';
 import type { Hub } from './hub';
 import type { ModelStore } from './models';
 import type { DB } from './db';
 import type { CertBundle } from './certs';
 import type { BenchRecord } from '../../web/src/shared/protocol';
+import { fleetCsvRows } from '../../web/src/shared/fleet';
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -24,6 +25,7 @@ const TYPES: Record<string, string> = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
   '.map': 'application/json',
+  '.wav': 'audio/wav',
 };
 
 const CSP = [
@@ -41,6 +43,8 @@ const CSP = [
 ].join('; ');
 
 const ORT_DIR = path.join(ROOT, 'node_modules/onnxruntime-web/dist');
+// Transformers.js (speech worker) pins its own onnxruntime-web build; npm nests it unless the versions match.
+const ORT_TJS_DIR = [path.join(ROOT, 'node_modules/@huggingface/transformers/node_modules/onnxruntime-web/dist'), ORT_DIR].find((d) => fs.existsSync(d))!;
 const WLLAMA_WASM = path.join(ROOT, 'node_modules/@wllama/wllama/esm/wasm/wllama.wasm');
 const WLLAMA_COMPAT_WASM = path.join(ROOT, 'node_modules/@wllama/wllama-compat/wasm/wllama.wasm');
 
@@ -69,13 +73,13 @@ export function makeHandler(deps: ServerDeps) {
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()');
+    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
 
     try {
       if (req.method === 'POST' && p === '/api/bench') return postBench(req, res, db);
       if (req.method !== 'GET' && req.method !== 'HEAD') return text(res, 405, 'Method not allowed');
 
-      if (p === '/') return redirect(res, local ? '/console' : '/join');
+      if (p === '/') return redirect(res, (local ? '/console' : '/join') + url.search);
       if (p === '/join' || p === '/node') return page(res, 'node.html');
       if (p === '/console') return page(res, 'console.html');
       if (p === '/bench') return page(res, 'bench.html');
@@ -92,6 +96,11 @@ export function makeHandler(deps: ServerDeps) {
         if (!/^ort[\w.-]*\.(mjs|wasm)$/.test(name)) return text(res, 404, 'Not found');
         return file(req, res, safeJoin(ORT_DIR, name), 'public, max-age=86400');
       }
+      if (p.startsWith('/vendor/ort-tjs/')) {
+        const name = p.slice('/vendor/ort-tjs/'.length);
+        if (!/^ort-wasm[\w.-]*\.(mjs|wasm)$/.test(name)) return text(res, 404, 'Not found');
+        return file(req, res, safeJoin(ORT_TJS_DIR, name), 'public, max-age=86400');
+      }
       if (p === '/vendor/wllama/wllama.wasm') return file(req, res, WLLAMA_WASM, 'public, max-age=86400');
       if (p === '/vendor/wllama-compat/wllama.wasm') return file(req, res, WLLAMA_COMPAT_WASM, 'public, max-age=86400');
       if (p.startsWith('/models/')) {
@@ -105,6 +114,11 @@ export function makeHandler(deps: ServerDeps) {
         const name = p.slice('/data/swarmsort/images/'.length);
         if (!/^\d{4}\.jpg$/.test(name)) return text(res, 404, 'Not found');
         return file(req, res, path.join(DATASET_DIR, 'images', name), 'public, max-age=31536000, immutable');
+      }
+      if (p.startsWith('/data/speech/')) {
+        const name = p.slice('/data/speech/'.length);
+        if (!/^[\w-]+\.(wav|json)$/.test(name)) return text(res, 404, 'Not found');
+        return file(req, res, path.join(SPEECH_DIR, name), 'public, max-age=86400');
       }
       if (p === '/recompute-ca.crt' || p === '/recompute-ca.cer') {
         const c = deps.certs();
@@ -133,6 +147,17 @@ export function makeHandler(deps: ServerDeps) {
           models: models.info(),
         });
       }
+      // The finished picture at wall size: every device on the Screen Wall loads it, so it is not teacher-only.
+      if (p === '/api/render/wall.png') {
+        hub.render
+          .wallImage()
+          .then((png) => {
+            res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': png.length, 'Cache-Control': 'no-cache' });
+            res.end(req.method === 'HEAD' ? undefined : png);
+          })
+          .catch((e) => text(res, 500, e instanceof Error ? e.message : 'error'));
+        return;
+      }
       if (p.startsWith('/api/')) {
         if (!control) return text(res, 403, 'Teacher only: open this from the Console link.');
         if (p === '/api/bench') return json(res, db.q.allBench.all());
@@ -150,6 +175,32 @@ export function makeHandler(deps: ServerDeps) {
               Object.assign(row, { eval_photos: s.evalPhotos, train_photos: s.trainPhotos, devices: s.participants, weight_bytes: s.weightBytes, photos_uploaded: 0 });
               return row;
             }),
+          );
+        if (p === '/api/render.png') {
+          const fp = hub.render.pngFile;
+          if (!fp) return text(res, 404, 'No finished render yet (the full picture is saved a few seconds after the last tile).');
+          res.setHeader('Content-Disposition', `attachment; filename="${path.basename(fp)}"`);
+          return file(req, res, fp, 'no-cache', 'image/png');
+        }
+        if (p === '/api/render/tiles.csv') {
+          res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="recompute-render-tiles.csv"', 'Cache-Control': 'no-cache' });
+          return res.end(hub.render.csv((id) => hub.nameOf(id)));
+        }
+        if (p === '/api/render.csv') {
+          if (!hub.renderRace) return text(res, 404, 'No Swarm Render race yet: run "1 device vs all" first.');
+          return csv(res, 'render.csv', hub.renderRace.rows, ['devices', 'seconds']);
+        }
+        if (p === '/api/fleet.csv') {
+          const f = hub.fleetInputs();
+          if (!f.efficiency || !f.perDevice.length) return text(res, 404, 'Nothing measured yet: the fleet calculator needs a benchmark and a speedup run.');
+          return csv(res, 'fleet.csv', fleetCsvRows(f, [Math.round(Number(url.searchParams.get('n')))]), ['fleet_devices', 'fleet_result', 'metric', 'unit', 'scaling_efficiency', 'measured_from']);
+        }
+        if (p === '/api/captions.csv')
+          return csv(
+            res,
+            'captions.csv',
+            hub.captions.timing.map((t) => ({ seq: t.seq, audio_s: t.audioSec, latency_s: t.lagSec, device: t.node, translated: t.translated ? 1 : 0 })),
+            ['seq', 'audio_s', 'latency_s', 'device', 'translated'],
           );
         if (p === '/api/export/runs.csv') {
           const rows = (db.raw.prepare('SELECT id, lab, kernel, total, status, created_at, finished_at, summary FROM jobs ORDER BY created_at').all() as Record<string, unknown>[]).map((j) => {
@@ -254,8 +305,8 @@ function csvCell(v: unknown) {
   return /[",\n\r]/.test(s) || /^[=+\-@]/.test(s) ? `"${s.replace(/^([=+\-@])/, "'$1").replace(/"/g, '""')}"` : s;
 }
 
-function csv(res: http.ServerResponse, name: string, rows: Record<string, unknown>[]) {
-  const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+function csv(res: http.ServerResponse, name: string, rows: Record<string, unknown>[], header?: string[]) {
+  const cols = header ?? [...new Set(rows.flatMap((r) => Object.keys(r)))];
   const body = [cols.join(','), ...rows.map((r) => cols.map((c) => csvCell(r[c])).join(','))].join('\r\n') + '\r\n';
   res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-cache' });
   res.end(body);
