@@ -52,7 +52,7 @@ const MAC_MODELS: [RegExp, string][] = [
   [/^Macmini/, 'Mac mini'],
 ];
 
-/** A friendly name for the Hub computer's own node tile, e.g. "iMac 2020 (Hub)". */
+/** A friendly name for the Hub computer's own node tile, e.g. "MacBook Pro (Hub)". */
 export function machineName(): string {
   const override = process.env.RECOMPUTE_HOST_NAME?.trim();
   if (override) return override.slice(0, 40);
@@ -62,7 +62,13 @@ export function machineName(): string {
       model = execFileSync('sysctl', ['-n', 'hw.model'], { encoding: 'utf8', timeout: 2000 }).trim();
     } catch {}
     const hit = MAC_MODELS.find(([re]) => re.test(model));
-    return `${hit ? hit[1] : 'This Mac'} (Hub)`;
+    if (hit) return `${hit[1]} (Hub)`;
+    // Apple-silicon ids (e.g. "Mac17,9") don't say what kind of Mac it is; ask the system.
+    try {
+      const m = /Model Name:\s*(.+)/.exec(execFileSync('system_profiler', ['SPHardwareDataType'], { encoding: 'utf8', timeout: 5000 }));
+      if (m) return `${m[1].trim().slice(0, 30)} (Hub)`;
+    } catch {}
+    return 'This Mac (Hub)';
   }
   if (process.platform === 'win32') return 'This PC (Hub)';
   return 'This computer (Hub)';

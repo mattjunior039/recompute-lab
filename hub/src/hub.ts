@@ -100,7 +100,7 @@ export interface HubInfo {
   caFingerprint: string;
   teacherKey: string;
   datasetCount: number;
-  /** Name for the Hub computer's own node tile, e.g. "iMac 2020 (Hub)". */
+  /** Name for the Hub computer's own node tile, e.g. "MacBook Pro (Hub)". */
   hostName?: string;
   /** Logical CPU threads on the Hub computer. */
   cpuThreads?: number;
@@ -142,7 +142,7 @@ export class Hub {
   private renderReset = false;
   private renderHeaderChanged = false;
   usecase: string | null;
-  wall: { scene: WallScene; at: number; gap: number; order: string[] };
+  wall: { scene: WallScene; at: number; gap: number; order: string[]; only?: Set<string> | null };
   captions = {
     on: false,
     translate: true,
@@ -482,7 +482,7 @@ export class Hub {
   wallDevices() {
     const on = (id: string) => {
       const n = this.nodes.get(id);
-      return !!(n && n.ws && !n.host && n.screen);
+      return !!(n && n.ws && !n.host && n.screen && (!this.wall.only || this.wall.only.has(id)));
     };
     return this.wall.order.filter(on).map((id) => this.nodes.get(id)!);
   }
@@ -654,7 +654,9 @@ export class Hub {
   // ---------- fleet calculator inputs (measured only) ----------
 
   fleetInputs(): FleetInputs {
-    const bench = this.db.q.allBench.all() as { test: string; value: number; unit: string; device: string; at?: number; created_at?: number }[];
+    // Old devices only: rows measured on the Hub computer (new hardware) are left out.
+    const isHub = (name: string | null | undefined) => /\(Hub\)/.test(name ?? '');
+    const bench = (this.db.q.allBench.all() as { test: string; value: number; unit: string; device: string; node_id: string | null }[]).filter((b) => b.node_id !== HOST_NODE_ID && !isHub(b.device));
     const best = new Map<string, FleetInputs['perDevice'][number]>();
     const want: Record<string, { kernel: string; label: string; unit: string }> = {
       'classify mobilenetv3': { kernel: 'classify', label: 'Image sorting', unit: 'images/s' },
@@ -667,10 +669,14 @@ export class Hub {
       const cur = best.get(w.kernel);
       if (!cur || b.value < cur.rate) best.set(w.kernel, { ...w, rate: b.value, device: b.device, source: `Benchmarks: ${b.test} on ${b.device}` });
     }
+    const alone = safeParse(this.db.get('renderAlone')) as { mrays: number; device: string; res: string; seconds: number } | null;
+    // The latest Swarm Render race (one old device alone, the full picture) is the most direct measurement, so it wins over /bench.
+    if (alone && alone.mrays > 0 && !isHub(alone.device))
+      best.set('render', { kernel: 'render', label: 'Rendering', unit: 'Mrays/s', rate: alone.mrays, device: alone.device, source: `Swarm Render race: ${alone.res} on ${alone.device} alone in ${alone.seconds} s` });
     // runs measured on the Swarm Sort lab count too (1-device baseline)
     const base = Number(this.db.get('baseline:classify')) || 0;
     if (!best.has('classify') && base > 0) best.set('classify', { kernel: 'classify', label: 'Image sorting', unit: 'images/s', rate: round(base, 2), device: 'one device', source: 'Swarm Sort run on one device' });
-    const sp = this.db.q.allSpeedup.all() as { experiment: string; lab: string; devices: number; speedup: number }[];
+    const sp = (this.db.q.allSpeedup.all() as { experiment: string; lab: string; devices: number; speedup: number; device_names: string | null }[]).filter((r) => !isHub(r.device_names));
     let efficiency: FleetInputs['efficiency'] = null;
     const multi = sp.filter((r) => r.devices >= 2 && r.speedup > 0);
     if (multi.length) {
@@ -915,7 +921,10 @@ export class Hub {
 
   private startExperiment(lab: LabId, items: number, order: string[], race = false, options: Record<string, unknown> = {}) {
     if (this.experiment?.status === 'running' || this.experiment?.status === 'preparing') throw new Error('An experiment is already running.');
-    const ids = order.filter((id) => this.nodes.get(id)?.ws);
+    // Measured runs use the old devices only: the Hub computer is new hardware and would inflate the numbers.
+    const hubPicked = order.some((id) => this.nodes.get(id)?.host);
+    const ids = order.filter((id) => this.nodes.get(id)?.ws && !this.nodes.get(id)?.host);
+    if (hubPicked) this.say('info', 'The Hub computer was left out: measured runs use the old devices only.');
     if (!ids.length) throw new Error('Pick at least one connected device.');
     if (race && ids.length < 2) throw new Error('"1 device vs all" needs at least two connected devices.');
     if (lab === 'render') items = labJob('render', options, this.info.datasetCount).total;
@@ -968,7 +977,14 @@ export class Hub {
     const row = { devices: names.length, names, seconds: round(seconds, 2), itemsPerSec: round(job.doneCount / seconds, 2), speedup: round(t1 / seconds, 2) };
     ex.rows.push(row);
     this.db.q.insertSpeedup.run(ex.id, Date.now(), job.id, ex.lab, row.devices, names.join(' + '), job.doneCount, row.seconds, row.itemsPerSec, row.speedup);
-    if (ex.lab === 'render') this.refreshRenderRace();
+    if (ex.lab === 'render') {
+      if (row.devices === 1) {
+        // One old device rendering alone is a real per-device speed for the fleet calculator.
+        const p = labJob('render', { res: ex.options.res, spp: ex.options.spp }, this.info.datasetCount).params as { width: number; height: number; spp: number };
+        this.db.set('renderAlone', JSON.stringify({ mrays: round((p.width * p.height * p.spp) / seconds / 1e6, 3), device: names[0], res: `${p.width}×${p.height}`, seconds: row.seconds }));
+      }
+      this.refreshRenderRace();
+    }
     if (ex.step >= this.experimentSteps(ex)) {
       ex.status = 'done';
       this.say('info', 'Speedup experiment finished. Download the CSV from the Benchmarks tab.');
@@ -1083,8 +1099,14 @@ export class Hub {
         this.startExperiment(msg.lab, Math.max(10, Math.min(5000, Math.round(Number(msg.items) || 200))), (msg.order ?? []).map(String));
         break;
       case 'race': {
-        const others = [...this.nodes.values()].filter((n) => n.ws && n.id !== msg.first && ['idle', 'working'].includes(n.status.state)).map((n) => n.id);
+        const only = Array.isArray(msg.devices) ? new Set(msg.devices.map(String)) : null;
+        const others = [...this.nodes.values()].filter((n) => n.ws && !n.host && n.id !== msg.first && (!only || only.has(n.id)) && ['idle', 'working'].includes(n.status.state)).map((n) => n.id);
         this.startExperiment('render', 0, [String(msg.first), ...others], true, msg.options ?? {});
+        break;
+      }
+      case 'film-node': {
+        const cue = msg.film ? { title: str(msg.film.title, 80), sub: str(msg.film.sub, 160), tap: !!msg.film.tap, did: !!msg.film.did } : null;
+        for (const n of this.nodes.values()) if (n.ws && !n.host && (msg.nodeId === '*' || n.id === msg.nodeId)) send(n.ws, { type: 'film', cue });
         break;
       }
       case 'usecase':
@@ -1099,6 +1121,8 @@ export class Hub {
           this.wall.order = [...ids, ...this.wall.order.filter((id) => !ids.includes(id))];
         }
         if (msg.gap !== undefined) this.wall.gap = clampGap(Number(msg.gap));
+        // Film mode can limit the wall to the chosen devices (e.g. not the phone used as the camera).
+        if (msg.only !== undefined) this.wall.only = Array.isArray(msg.only) && msg.only.length ? new Set(msg.only.map(String)) : null;
         if (msg.scene && ['off', 'black', 'wake', 'image', 'sweep', 'show'].includes(msg.scene)) {
           this.wall.scene = msg.scene;
           this.wall.at = Date.now() + 800; // a little lead time so every screen starts together
@@ -1160,6 +1184,7 @@ export class Hub {
         if (msg.what === 'bench') this.db.q.clearBench.run();
         if (msg.what === 'speedup') {
           this.db.q.clearSpeedup.run();
+          this.db.set('renderAlone', '');
           this.refreshRenderRace();
         }
         if (msg.what === 'history') {
@@ -1411,4 +1436,8 @@ function sanitizeStatus(st: Partial<NodeStatus> | undefined): NodeStatus {
     },
     fedPhotos: Array.isArray(st?.fedPhotos) ? st!.fedPhotos.slice(0, 3).map((v) => Math.max(0, Math.min(10000, Number(v) || 0))) : [0, 0, 0],
   };
+}
+
+function str(v: unknown, max: number) {
+  return typeof v === 'string' && v ? v.slice(0, max) : undefined;
 }

@@ -6,13 +6,14 @@ import { h, clear, fmtInt, fmtNum, fmtTime, fmtBytes, toast, DEVICE_ICON } from 
 import { lineChart, barChart } from '../shared/charts';
 import type { ConsoleCmd, ConsoleState, LabId, NodeView, RunView } from '../shared/protocol';
 import * as v2 from './v2';
+import * as film from './film';
 
 const qs = new URLSearchParams(location.search);
 const KEY = qs.get('key') ?? '';
 const keyQ = KEY ? `key=${encodeURIComponent(KEY)}` : '';
 const app = document.getElementById('app')!;
 
-// ---------- screen scaling: legible on a 1080p projector, a 5K iMac and a 4K TV alike ----------
+// ---------- screen scaling: legible on a 1080p projector, a 5K display and a 4K TV alike ----------
 const ZOOM_KEY = 'recompute.console.zoom';
 function zoomSetting(): string {
   try {
@@ -56,6 +57,7 @@ function connect() {
       v2.setState(m.state);
       v2.noteHubTime(m.state.t);
       update();
+      film.onState();
     } else if (m.type === 'render-tiles') v2.onRenderTiles(m);
     else if (m.type === 'toast') toast(m.text, m.level);
   };
@@ -111,6 +113,7 @@ function go(v: string) {
   update();
 }
 v2.initV2({ region, canvas, cmd, update: () => update(), keyQ, go });
+film.initFilm({ state: () => S, cmd, go, update: () => update(), keyQ });
 v2.onOpenDoc(() => {
   showDoc = true;
 });
@@ -141,6 +144,11 @@ function updateHead() {
       h(
         'div',
         { class: 'row' },
+        S?.canControl ? (() => {
+          const b = h('button', { class: 'film-btn', title: 'Run every demo chapter hands-free on the joined devices' }, '🎬 Film mode');
+          b.onclick = () => film.open();
+          return b;
+        })() : null,
         S?.demo ? h('span', { class: 'flag' }, 'DEMO MODE') : null,
         !connected ? h('span', { class: 'pill bad' }, 'Hub disconnected') : null,
         S && !S.canControl ? h('span', { class: 'pill warn' }, 'view only') : null,
@@ -698,7 +706,8 @@ function experimentPanel(s: ConsoleState) {
 function benchView(s: ConsoleState) {
   if (!benchLoaded) void loadBench();
   const csv = (name: string, label: string) => h('a', { href: `/api/export/${name}.csv${keyQ ? `?${keyQ}` : ''}`, class: 'small', download: '' }, label);
-  const online = s.nodes.filter((n) => n.online);
+  // The Hub computer is new hardware: it never takes part in a speedup experiment.
+  const online = s.nodes.filter((n) => n.online && !n.host);
   const exRunning = s.experiment?.status === 'running' || s.experiment?.status === 'preparing';
   const exp = region('exp-form', [online.map((n) => [n.id, n.name]), expPick, expLab, expItems, s.experiment?.status, s.datasetCount], () => {
     const labSel = h('select', null, h('option', { value: 'swarm-sort', selected: expLab === 'swarm-sort' }, 'Swarm Sort'), h('option', { value: 'sweep', selected: expLab === 'sweep' }, 'Science Sweep (π)'));
@@ -719,7 +728,7 @@ function benchView(s: ConsoleState) {
       };
       return b;
     });
-    const all = h('button', { class: 'small' }, `Use all ${online.length} (Chromebook first, Hub last)`);
+    const all = h('button', { class: 'small' }, `Use all ${online.length} (Chromebook first)`);
     all.disabled = !online.length;
     all.onclick = () => {
       expPick.splice(0, expPick.length, ...autoOrder(online));
@@ -740,7 +749,7 @@ function benchView(s: ConsoleState) {
       'div',
       { class: 'card col' },
       h('h2', null, 'Automated speedup experiment'),
-      h('p', { class: 'muted' }, 'Runs the same job on the first device, then the first two, then three… and logs every time. First every device loads the image model and saves the photos, so downloads never count against step 1. Tap “Use all”, or tap devices in the order to add them.'),
+      h('p', { class: 'muted' }, 'Runs the same job on the first device, then the first two, then three… and logs every time. Old devices only: the Hub computer is never part of it. First every device loads the image model and saves the photos, so downloads never count against step 1. Tap “Use all”, or tap devices in the order to add them.'),
       h('div', { class: 'row' }, 'Lab', labSel, expLab === 'sweep' ? 'Batches' : 'Photos', items),
       h('div', { class: 'row' }, all, none),
       h('div', { class: 'row' }, ...picks),
@@ -868,7 +877,7 @@ function setupView(s: ConsoleState) {
         'div',
         { class: 'card col' },
         h('h2', null, 'Screen size'),
-        h('p', { class: 'muted' }, 'Auto makes everything bigger on wide screens (a 5K iMac or a 4K TV), so it reads on camera. Saved on this computer.'),
+        h('p', { class: 'muted' }, 'Auto makes everything bigger on wide screens (a 5K display or a 4K TV), so it reads on camera. Saved on this computer.'),
         h(
           'div',
           { class: 'row' },
@@ -932,14 +941,14 @@ function hostCard(s: ConsoleState) {
     for (let k = 1; k <= s.hostCompute.maxWorkers; k++) opts.push(k);
     const sel = h('select', { class: 'small', 'aria-label': 'Workers' }, ...opts.map((k) => h('option', { value: String(k), selected: k === s.hostCompute.workers }, `${k} worker${k === 1 ? '' : 's'}`)));
     sel.onchange = () => cmd({ cmd: 'host-compute', on, workers: Number(sel.value) });
-    const st = !on ? 'Off: this computer only coordinates.' : !me?.online ? 'Starting…' : me.status.state === 'working' ? `Computing · ${fmtNum(me.status.rate)}/s` : me.status.ready.mobilenet ? 'Ready' : 'Getting ready…';
+    const st = !on ? 'Hub coordinates only — all compute on old devices' : !me?.online ? 'Starting…' : me.status.state === 'working' ? `Computing · ${fmtNum(me.status.rate)}/s` : me.status.ready.mobilenet ? 'Ready' : 'Getting ready…';
     return h(
       'div',
       { class: `card col ${on ? 'host-on' : ''}` },
       h('h2', null, s.hostCompute.name),
       h('div', { class: 'row' }, b),
       h('div', { class: 'row small' }, h('span', { class: 'grow muted' }, st), sel),
-      h('div', { class: 'muted small' }, 'Adds the Hub computer as one more device with its own tile. Keep this Console window open while it computes.'),
+      h('div', { class: 'muted small' }, on ? 'The Hub computer is new hardware, so it is left out of every measured result (race, speedup, fleet). Keep this Console window open while it computes.' : 'Turn on to add the Hub computer as one more device with its own tile. It is never counted in measured results.'),
     );
   });
 }

@@ -248,3 +248,63 @@ a.btnlink.small { padding: 4px 10px; font-size: 14px; border-radius: 8px; }
 .uc button { align-self: flex-start; margin-top: auto; }
 td.big-num { font-size: 28px; font-weight: 800; }
 @media (max-width: 900px) { .render-hud { grid-template-columns: repeat(2, minmax(0, 1fr)); } .doc-pair { grid-template-columns: 1fr; } .cap-en { font-size: 32px; } .cap-es { font-size: 26px; } }
+
+/* Film mode cues on a node: big, high-contrast, never pure white (the camera's exposure stays steady). */
+.film-banner { position: fixed; left: 0; right: 0; top: 0; z-index: 60; padding: 18px 24px; background: rgba(7, 12, 24, .94); border-bottom: 3px solid var(--green); text-align: center; pointer-events: none; }
+.film-banner .film-title { font-size: clamp(28px, 5vw, 64px); font-weight: 900; letter-spacing: -.01em; color: #e6fff5; }
+.film-banner .film-sub { font-size: clamp(16px, 2.4vw, 30px); color: #a7f3d0; margin-top: 4px; }
+.film-tap { position: fixed; inset: 0; z-index: 61; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: rgba(6, 78, 59, .55); cursor: pointer; touch-action: manipulation; }
+.film-tap-hand { font-size: clamp(80px, 16vw, 200px); animation: film-pulse 1.1s ease-in-out infinite; }
+.film-tap-text { font-size: clamp(34px, 7vw, 96px); font-weight: 900; color: #ecfdf5; text-shadow: 0 4px 24px #000; }
+@keyframes film-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.18); } }
+body.film-did .did-wrap { outline: 4px solid var(--green); outline-offset: 6px; border-radius: 16px; }
+body.film-did .chips .chip { font-size: 26px; }
+
+/* ---------- 🎬 Film mode (Console) ---------- */
+.film-btn { background: #3b0764; border-color: var(--violet); color: #f5f3ff; font-weight: 800; }
+.film { position: fixed; inset: 0; z-index: 100; background: rgba(5, 9, 18, 0.94); overflow: auto; padding: 32px; }
+.film.hidden, .film-bar.hidden, .film-title.hidden, .film-flash.hidden { display: none; }
+.film-panel { max-width: 1500px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; font-size: 20px; }
+.film-panel h1 { margin: 0; font-size: 44px; }
+.film-panel h2 { margin: 8px 0 0; }
+.film-devs { display: flex; flex-direction: column; gap: 8px; }
+.film-dev { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; background: var(--panel); border: 2px solid var(--line); border-radius: 14px; padding: 10px 14px; cursor: pointer; }
+.film-dev.off { opacity: 0.5; }
+.film-dev input { width: 26px; height: 26px; }
+.film-dev-n { font-weight: 800; font-size: 22px; min-width: 280px; }
+.film-dev-r { display: flex; flex-wrap: wrap; gap: 6px; }
+.film-grid { display: grid; grid-template-columns: max-content 1fr; gap: 10px 18px; align-items: center; }
+.film-go { font-size: 28px; padding: 16px 34px; }
+button.warn { background: var(--amber); color: #3a2503; border-color: var(--amber); }
+.film-log { border-collapse: collapse; width: 100%; }
+.film-log td, .film-log th { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.film-net { display: inline-block; padding: 6px 16px; border-radius: 999px; font-weight: 900; font-size: 22px; white-space: nowrap; }
+.film-net.off { background: #064e3b; border: 2px solid var(--green); color: #d1fae5; }
+.film-net.on { background: #422006; border: 2px solid var(--amber); color: #fde68a; }
+.film-net.unk { background: var(--panel2); border: 2px solid var(--line); color: var(--muted); }
+.film-bar { position: fixed; left: 0; right: 0; top: 0; z-index: 90; display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 14px 22px; background: #080d1a; border-bottom: 2px solid var(--violet); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6); font-size: 22px; }
+.film-rec { color: var(--red); font-weight: 900; letter-spacing: 0.08em; }
+.film-ch { font-weight: 800; font-size: 26px; }
+.film-time { font-variant-numeric: tabular-nums; color: var(--muted); }
+.film-prompt { flex-basis: 100%; text-align: center; padding: 10px 0 6px; }
+.film-prompt-t { font-size: 46px; font-weight: 900; color: var(--amber); }
+.film-prompt-s { font-size: 22px; color: var(--muted); }
+.film-title { position: fixed; inset: 0; z-index: 110; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: radial-gradient(circle at 50% 45%, #13263d 0%, #05080f 70%); transition: opacity 0.45s; text-align: center; }
+.film-title.out { opacity: 0; }
+.film-title-n { font-size: 30px; color: var(--blue); font-weight: 800; letter-spacing: 0.2em; text-transform: uppercase; }
+.film-title-t { font-size: 96px; font-weight: 900; line-height: 1.05; max-width: 90vw; }
+.film-title-s { font-size: 36px; color: var(--muted); }
+.film-count { font-size: 260px; font-weight: 900; color: var(--text); }
+.film-flash { position: fixed; inset: 0; z-index: 120; background: #fff; }
+.uc.film-focus { outline: 4px solid var(--blue); outline-offset: 4px; }
+.film-net.big { font-size: 64px; padding: 14px 40px; border-width: 4px; }
+.film-join { display: flex; gap: 48px; align-items: center; justify-content: center; min-height: calc(100vh - 64px); flex-wrap: wrap; }
+.film-join-qr { background: #fff; border-radius: 24px; padding: 18px; line-height: 0; }
+.film-qr { width: min(46vw, 78vh); height: auto; image-rendering: pixelated; }
+.film-join-side { display: flex; flex-direction: column; gap: 18px; max-width: 760px; font-size: 26px; }
+.film-join-side h1 { font-size: 72px; margin: 0; }
+.film-join-url { font-size: 34px; font-weight: 800; color: var(--blue); word-break: break-all; }
+.film-join-step b { font-size: 44px; letter-spacing: 0.1em; }
+.film-join-count { font-size: 44px; font-weight: 900; color: var(--green); }
+.film-join-devs { display: flex; flex-wrap: wrap; gap: 10px; }
+.film-join-devs .pill { font-size: 22px; padding: 6px 14px; }

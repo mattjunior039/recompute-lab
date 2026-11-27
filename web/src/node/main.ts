@@ -498,6 +498,28 @@ async function onMessage(m: HubToNode) {
     case 'wall':
       wall.onMessage(m);
       break;
+    case 'film':
+      showFilmCue(m.cue);
+      break;
+  }
+}
+
+// ---------- Film mode cues (big, readable labels while the Console runs its demo) ----------
+const filmBanner = h('div', { class: 'film-banner hidden', 'aria-live': 'polite' });
+const filmTap = h('div', { class: 'film-tap hidden' }, h('div', { class: 'film-tap-hand' }, '👆'), h('div', { class: 'film-tap-text' }, 'Tap this screen now'));
+document.body.append(filmBanner, filmTap);
+// The tap layer catches the tap itself (so it can't hit STOP by accident); the window-level
+// input listener still sees it and pauses computing, exactly like any other tap.
+filmTap.addEventListener('pointerdown', () => filmTap.classList.add('hidden'));
+function showFilmCue(cue: import('../shared/protocol').FilmCue | null) {
+  const title = cue?.title ?? '';
+  clear(filmBanner, title ? h('div', { class: 'film-title' }, title) : null, cue?.sub ? h('div', { class: 'film-sub' }, cue.sub) : null);
+  filmBanner.classList.toggle('hidden', !title);
+  filmTap.classList.toggle('hidden', !cue?.tap || !CAN_PAUSE_ON_INPUT);
+  document.body.classList.toggle('film-did', !!cue?.did);
+  if (cue?.did && MODE === 'join') {
+    showTab('compute');
+    requestAnimationFrame(() => els.did.scrollIntoView({ behavior: 'smooth', block: 'center' }));
   }
 }
 
@@ -760,7 +782,7 @@ const els = {
   pauseText: h('span'),
   resumeBtn: h('button', { class: 'small primary hidden', 'data-no-pause': '' }, 'Resume now'),
   pauseToggle: h('input', { type: 'checkbox' }) as HTMLInputElement,
-  did: h('div'),
+  did: h('div', { class: 'did-wrap' }),
 };
 els.powerChip.append(els.powerText, els.battBtn);
 els.pauseChip.append(els.pauseText, els.resumeBtn);

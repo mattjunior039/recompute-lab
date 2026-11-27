@@ -76,7 +76,18 @@ export type HubToNode =
   | { type: 'fed:model'; sessionId: string; round: number; weights: string; dims: [number, number] }
   | { type: 'fed:reset' }
   | { type: 'clock'; id: number; hub: number }
+  | { type: 'film'; cue: FilmCue | null }
   | WallMsg;
+
+/** Film mode: what a node shows on top of its normal page (null = nothing). Never blocks taps. */
+export interface FilmCue {
+  title?: string;
+  sub?: string;
+  /** Pulsing "Tap this screen now" prompt. */
+  tap?: boolean;
+  /** Bring the "What my device did" panel and the power chip to the front. */
+  did?: boolean;
+}
 
 /** Screen Wall: what one node shows. Times are Hub clock (ms since epoch). */
 export interface WallMsg {
@@ -374,8 +385,9 @@ export type ConsoleCmd =
   | { cmd: 'host-compute'; on: boolean; workers?: number }
   | { cmd: 'clear'; what: 'bench' | 'speedup' | 'history' }
   | { cmd: 'render-sync' }
-  | { cmd: 'race'; lab: 'render'; first: string; options?: Record<string, unknown> }
-  | { cmd: 'wall'; scene?: WallScene; order?: string[]; gap?: number }
+  | { cmd: 'race'; lab: 'render'; first: string; options?: Record<string, unknown>; devices?: string[] }
+  | { cmd: 'film-node'; nodeId: string; film: FilmCue | null }
+  | { cmd: 'wall'; scene?: WallScene; order?: string[]; gap?: number; only?: string[] | null }
   | { cmd: 'captions'; on: boolean; translate?: boolean }
   | { cmd: 'caption-audio'; seq: number; pcm: string; sampleRate: number; endedAt: number }
   | { cmd: 'captions-clear' }

@@ -517,7 +517,7 @@ interface Mic {
   proc: ScriptProcessorNode;
   stream: MediaStream | null;
   src: AudioNode;
-  kind: 'mic' | 'sample';
+  kind: 'mic' | 'sample' | 'file';
   buf: Float32Array[];
   len: number;
   loud: boolean;
@@ -528,7 +528,8 @@ let capSeq = 0;
 const MIN_SEC = 2;
 const MAX_SEC = 5;
 
-async function startAudio(kind: 'mic' | 'sample') {
+/** Feed captions from the microphone, the bundled sample, or a chosen recording (Film mode). */
+export async function startAudio(kind: 'mic' | 'sample' | 'file', file?: ArrayBuffer) {
   stopAudio();
   const ctx = new AudioContext();
   let src: AudioNode;
@@ -538,7 +539,7 @@ async function startAudio(kind: 'mic' | 'sample') {
     stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     src = ctx.createMediaStreamSource(stream);
   } else {
-    const wav = await (await fetch('/data/speech/sample-en.wav')).arrayBuffer();
+    const wav = kind === 'file' && file ? file.slice(0) : await (await fetch('/data/speech/sample-en.wav')).arrayBuffer();
     const buf = await ctx.decodeAudioData(wav);
     const bs = ctx.createBufferSource();
     bs.buffer = buf;
@@ -562,7 +563,12 @@ async function startAudio(kind: 'mic' | 'sample') {
   C.update();
 }
 
-function stopAudio() {
+/** Which audio source is feeding captions right now, if any. */
+export function audioKind() {
+  return mic?.kind ?? null;
+}
+
+export function stopAudio() {
   const m = mic;
   if (!m) return;
   mic = null;
@@ -935,6 +941,9 @@ function nightPanel(s: ConsoleState): Node {
 // =====================================================================================
 
 let fleetSize = 30;
+export function setFleetSize(n: number) {
+  fleetSize = Math.max(1, Math.min(1_000_000, Math.round(n)));
+}
 const FLEET_PRESETS: [number, string][] = [
   [FLEET_SIZES[0], 'One cart (30)'],
   [FLEET_SIZES[1], 'A district’s retired devices (9,483)'],
@@ -948,7 +957,7 @@ function fleetPanel(s: ConsoleState): Node {
     if (!ready)
       return h(
         'div',
-        { class: 'card col' },
+        { class: 'card col', id: 'fleet' },
         head,
         h('p', { class: 'muted', style: 'margin:0' }, 'This stays empty until there are real measurements. It needs:'),
         h('div', null, `${f.perDevice.length ? '✓' : '○'} a per-device speed (Benchmarks: open /bench on a device and tap Run)`),
@@ -966,7 +975,7 @@ function fleetPanel(s: ConsoleState): Node {
     const dl = h('a', { class: 'btnlink small', href: withKey(`/api/fleet.csv?n=${N}`), download: 'fleet.csv', title: 'Projection from measured per-device speed × measured scaling efficiency; real results vary.' }, '⬇ fleet.csv');
     return h(
       'div',
-      { class: 'card col' },
+      { class: 'card col', id: 'fleet' },
       head,
       h('div', { class: 'row' }, ...FLEET_PRESETS.map(([n, l]) => btn(l, () => ((fleetSize = n), C.update()), N === n ? 'primary small' : 'small')), 'Custom:', custom, 'devices'),
       h(

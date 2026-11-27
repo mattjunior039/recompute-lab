@@ -101,6 +101,7 @@ The Console's **Use cases** tab has a one-screen card for each place where a pil
 | **Home and family** | Any Lab, pooling the family's old phones and laptops on the home Wi-Fi |
 
 - **Night Shift** queues jobs to run later, one after another, and only on devices that are plugged in and idle: for example, a charging cart overnight.
+- **🎬 Film mode** (Console header) runs a hands-free showcase on the joined devices, for a science fair or an open house: the wall wake-up, a render race (one device alone, then all of them), captions, the tutor, Teach the Swarm, a "tap to pause" moment and the use cases, each with a title card. At the end it downloads a zip with the measured results (CSV), the render, and a timestamped chapter log for editing a recording. The Hub only coordinates during a run, so every number comes from the devices.
 - **Fleet calculator:** enter a fleet size (one cart of 30, or a whole district's retired devices) and see projected images per hour, render time, and caption-hours. It's labeled *"Projection from measured per-device speed × measured scaling efficiency; real results vary"*, and it shows **nothing** until you've measured your own devices.
 
 ## Quickstart (about 5 minutes)
@@ -121,7 +122,7 @@ You need one computer to be the Hub (macOS, Windows, or Linux) and devices on th
    The first start downloads the AI models once (about 570 MB, including the speech models for Live Captions) and checks their SHA-256 fingerprints. When it prints **"Models ready"**, Recompute works with the internet unplugged.
 4. **Open the Console** on the Hub computer at **http://localhost:8080/console**. It shows a big QR code and a 6-digit room code.
 5. **Join devices** by scanning the QR code. The first time on each device, trust the Hub's certificate (about 2 minutes, see [docs/trust-certificate.md](docs/trust-certificate.md)), or use the basic http address if you're short on time.
-6. Pick a Lab on the Console and press start. To let the Hub computer help too, click **💻 This computer computes too**.
+6. Pick a Lab on the Console and press start. To let the Hub computer help too, click **💻 This computer computes too** (it's never counted in measured results, so speedups always describe the joined devices).
 
 Press **Ctrl+C** in the terminal to stop the Hub. All Hub data (models, certificates, database) lives in the `.recompute/` folder; delete it to start completely fresh.
 

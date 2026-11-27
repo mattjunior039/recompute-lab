@@ -131,14 +131,15 @@ await con.getByRole('button', { name: 'Benchmarks' }).click();
 await con.locator('input[type=number]').first().fill('120');
 await con.locator('input[type=number]').first().dispatchEvent('change');
 await con.getByRole('button', { name: /^Use all/ }).click();
-await con.getByRole('button', { name: /▶ Run 1 → 3 devices/ }).click();
+// Old devices only: the Hub computer never takes part, even with "computes too" on.
+await con.getByRole('button', { name: /▶ Run 1 → 2 devices/ }).click();
 const ex = await until(async () => {
   const s = await S();
   return s.experiment && ['done', 'cancelled'].includes(s.experiment.status) ? s.experiment : null;
 }, 240_000, 'experiment done');
 report(
-  'one-click experiment runs 1 → 3 devices',
-  ex.status === 'done' && ex.rows.length === 3 && ex.order[0] === 'Test Chromebook' && ex.order[2] === st0.hostCompute.name,
+  'one-click experiment runs 1 → 2 old devices, Hub left out',
+  ex.status === 'done' && ex.rows.length === 2 && ex.order[0] === 'Test Chromebook' && !ex.order.includes(st0.hostCompute.name),
   ex.rows.map((r) => `${r.devices} dev ${r.seconds}s ${r.speedup}×`).join(' | ') + ` (order: ${ex.order.join(' → ')})`,
 );
 await con.screenshot({ path: `${OUT}/console-2560-experiment.png`, fullPage: true });
@@ -152,7 +153,7 @@ await until(async () => !(await S()).nodes.some((n) => n.host), 10_000, 'host ti
 const frames = await con.locator('iframe.host-frame').count();
 report('toggle off removes the Hub node', frames === 0, 'no host frame, no tile');
 
-// 4K TV (3840 CSS px) and 5K iMac (2560 CSS px @2x) screenshots.
+// 4K TV (3840 CSS px) and 5K display (2560 CSS px @2x) screenshots.
 await con.setViewportSize({ width: 3840, height: 2160 });
 await sleep(1200);
 const z4k = await con.evaluate(() => document.documentElement.style.getPropertyValue('zoom'));

@@ -76,7 +76,7 @@ export function makeHandler(deps: ServerDeps) {
     res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
 
     try {
-      if (req.method === 'POST' && p === '/api/bench') return postBench(req, res, db);
+      if (req.method === 'POST' && p === '/api/bench') return postBench(req, res, db, local);
       if (req.method !== 'GET' && req.method !== 'HEAD') return text(res, 405, 'Method not allowed');
 
       if (p === '/') return redirect(res, (local ? '/console' : '/join') + url.search);
@@ -161,6 +161,10 @@ export function makeHandler(deps: ServerDeps) {
       if (p.startsWith('/api/')) {
         if (!control) return text(res, 403, 'Teacher only: open this from the Console link.');
         if (p === '/api/bench') return json(res, db.q.allBench.all());
+        if (p === '/api/internet') {
+          internetCheck().then((r) => json(res, r));
+          return;
+        }
         if (p === '/api/export/bench.csv') return csv(res, 'recompute-benchmarks.csv', db.q.allBench.all() as Record<string, unknown>[]);
         if (p === '/api/export/speedup.csv') return csv(res, 'recompute-speedup-experiments.csv', db.q.allSpeedup.all() as Record<string, unknown>[]);
         if (p === '/api/export/watts.csv') return csv(res, 'recompute-measured-watts.csv', db.q.allWatts.all() as Record<string, unknown>[]);
@@ -312,7 +316,7 @@ function csv(res: http.ServerResponse, name: string, rows: Record<string, unknow
   res.end(body);
 }
 
-function postBench(req: http.IncomingMessage, res: http.ServerResponse, db: DB) {
+function postBench(req: http.IncomingMessage, res: http.ServerResponse, db: DB, fromHub = false) {
   let body = '';
   req.setEncoding('utf8');
   req.on('data', (d) => {
@@ -330,7 +334,8 @@ function postBench(req: http.IncomingMessage, res: http.ServerResponse, db: DB) 
           const c = r.caps ?? ({} as BenchRecord['caps']);
           const s = (x: unknown, n = 120) => (x === null || x === undefined ? null : String(x).slice(0, n));
           db.q.insertBench.run(
-            now, s(r.nodeId, 40), s(r.device, 60), s(c.deviceType, 20), s(c.browser, 60),
+            // A benchmark run on the Hub computer itself is marked, so it never counts as an "old device" number.
+            now, s(r.nodeId, 40), fromHub && !/\(Hub\)/.test(String(r.device ?? '')) ? `${s(r.device, 50) ?? 'This computer'} (Hub)` : s(r.device, 60), s(c.deviceType, 20), s(c.browser, 60),
             Number(c.cores) || null, c.memoryGB === null || c.memoryGB === undefined ? null : Number(c.memoryGB), s(c.webgpu),
             c.isolated ? 1 : 0, c.secure ? 1 : 0, s(c.ua, 300),
             s(r.test, 60), s(r.backend, 30), Number(r.threads) || null, v, s(r.unit, 20), s(r.detail, 300),
@@ -342,4 +347,22 @@ function postBench(req: http.IncomingMessage, res: http.ServerResponse, db: DB) 
       text(res, 400, 'bad benchmark data');
     }
   });
+}
+
+/** Is the internet reachable from the Hub? Checked by the Hub itself (a page can't reliably test this). */
+let lastNet: { at: number; online: boolean; checked: string[] } | null = null;
+let netBusy: Promise<{ at: number; online: boolean; checked: string[] }> | null = null;
+const NET_PROBES = ['https://connectivitycheck.gstatic.com/generate_204', 'https://www.apple.com/library/test/success.html', 'https://1.1.1.1/'];
+export function internetCheck() {
+  if (lastNet && Date.now() - lastNet.at < 4000) return Promise.resolve(lastNet);
+  netBusy ??= Promise.all(
+    NET_PROBES.map((u) =>
+      fetch(u, { method: 'HEAD', signal: AbortSignal.timeout(3000), redirect: 'manual' })
+        .then(() => true)
+        .catch(() => false),
+    ),
+  )
+    .then((ok) => (lastNet = { at: Date.now(), online: ok.some(Boolean), checked: NET_PROBES.map((u) => new URL(u).host) }))
+    .finally(() => (netBusy = null));
+  return netBusy;
 }

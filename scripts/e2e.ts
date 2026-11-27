@@ -1,5 +1,5 @@
 // End-to-end check: real Hub + several headless browser "devices".
-// Usage: npx tsx scripts/e2e.ts [--base http://localhost:8080] [--nodes 4] [--only sort,kill,fed,sweep,tutor,http,render,wall,captions,translate,console]
+// Usage: npx tsx scripts/e2e.ts [--base http://localhost:8080] [--nodes 4] [--only sort,kill,fed,sweep,tutor,http,render,wall,captions,translate,console,film]
 // Start the Hub first (npm run hub). Prints a PASS/FAIL line per check.
 
 import fs from 'node:fs';
@@ -416,6 +416,73 @@ try {
   }
 
   // ---------- 11. Console pages render without errors ----------
+  // ---------- 🎬 Film mode: every chapter, hands-free, in a real Console page ----------
+  if (ONLY.has('film')) {
+    const { execFileSync } = await import('node:child_process');
+    const os = await import('node:os');
+    const hero = devs[0];
+    const camera = devs.length > 2 ? devs.at(-1)! : null;
+    cmd({ cmd: 'rename', nodeId: hero.id, name: 'Chromebook (stand-in)' });
+    if (camera) cmd({ cmd: 'rename', nodeId: camera.id, name: 'iPhone 17e (camera)' });
+    const crew = devs.filter((d) => d !== camera);
+    const tutor = S!.models.find((m) => m.kind === 'gguf' && m.ready)?.id;
+    cmd({ cmd: 'node', nodeId: '*', action: 'prepare', args: { all: true, ...(tutor ? { tutor } : {}), speech: { asr: true, mt: true } } });
+    await until(() => crew.every((d) => { const r = nodeView(d.id)?.status.ready; return r && r.mobilenet && r.dataset >= S!.datasetCount && (!tutor || r.tutor) && r.asr; }), 600_000, 'film devices prepared');
+    // Stand-in Teach photos (Caltech groups); on film day these are real photos taken on each device.
+    const manifest = JSON.parse(fs.readFileSync(path.resolve('data/swarmsort/manifest.json'), 'utf8')) as { items: { file: string; category: string }[] };
+    const groups = [['Motorbikes', 'car_side'], ['cougar_face', 'Leopards'], ['sunflower', 'lotus']];
+    const byClass = groups.map((cats) => manifest.items.filter((it) => cats.includes(it.category)).slice(0, 12).map((it) => `/data/swarmsort/images/${it.file}`));
+    for (let c = 0; c < 3; c++)
+      for (let i = 0; i < byClass[c].length; i++) await crew[i % crew.length].page.evaluate(([u, l]) => (window as any).__recompute.addPhotoFromUrl(u, l), [byClass[c][i], c] as const);
+    await until(() => crew.every((d) => (nodeView(d.id)?.status.fedPhotos.reduce((a, b) => a + b, 0) ?? 0) > 0), 30_000, 'Teach photos');
+
+    const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1920, height: 1080 }, acceptDownloads: true });
+    const page = await ctx.newPage();
+    const errs: string[] = [];
+    page.on('pageerror', (e) => errs.push(e.message));
+    await page.goto(`${BASE}/console`);
+    await page.waitForSelector('.film-btn');
+    await page.click('.film-btn');
+    await page.waitForSelector('.film-panel');
+    await sleep(1500);
+    const conf = await page.evaluate(() => (window as any).__film.configure({ practice: true, hero: 'Chromebook (stand-in)', res: '1080p', spp: 1, audio: 'sample' }));
+    console.log(`   Film devices: ${conf.picked.join(', ')} · hero ${conf.hero}`);
+    report('Film mode leaves the camera phone out', !camera || !conf.picked.includes('iPhone 17e (camera)'), camera ? 'iPhone 17e (camera) unticked automatically' : 'no camera stand-in');
+    const download = page.waitForEvent('download', { timeout: 30 * 60_000 });
+    await page.click('.film-go');
+    // Chapter 7 asks for one real tap on the hero device.
+    const tapLayer = await hero.page.waitForSelector('.film-tap', { state: 'visible', timeout: 20 * 60_000 });
+    await sleep(1200);
+    const box = await tapLayer.boundingBox();
+    await hero.page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    const dl = await download;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rc-film-'));
+    const zipPath = path.join(dir, dl.suggestedFilename());
+    await dl.saveAs(zipPath);
+    execFileSync('unzip', ['-q', '-o', zipPath, '-d', path.join(dir, 'out')]);
+    const out = (f: string) => path.join(dir, 'out', f);
+    const flog = JSON.parse(fs.readFileSync(out('film-log.json'), 'utf8'));
+    for (const c of flog.acts) console.log(`   ${c.n}. ${c.title}: ${c.status} ${c.note ? `(${c.note})` : ''}`);
+    const done = flog.acts.filter((c: any) => c.status === 'done').map((c: any) => c.n);
+    report('Film mode runs every chapter hands-free', [1, 2, 3, 4, 5, 6, 7, 8, 9].every((n) => done.includes(n)), `done: ${done.join(', ')} · zip ${dl.suggestedFilename()}`);
+    const CONTRACT = ['wake', 'wall', 'render_solo', 'render_swarm', 'render_wall', 'offline', 'captions', 'tutor', 'teach', 'pause', 'did', 'usecases', 'nightshift', 'fleet'];
+    const ids = flog.chapters.map((c: any) => c.id);
+    report('film-log.json chapter ids match the editing contract', JSON.stringify(ids) === JSON.stringify(CONTRACT) && flog.chapters.every((c: any) => Object.keys(c).join() === 'id,title,start,end'), ids.join(' '));
+    const ts = flog.chapters.flatMap((c: any) => [Date.parse(c.start), Date.parse(c.end)]);
+    report('film-log.json has wall-clock times', !!flog.sync_at && ts.every((t: number, i: number) => !Number.isNaN(t) && (i === 0 || t >= ts[i - 1])) && ts[0] > Date.parse(flog.sync_at) && flog.hub_computes === false, `sync_at ${flog.sync_at} · ${flog.chapters.length} beats in order`);
+    report('Film run used only the picked old devices', flog.devices.length === crew.length && !flog.devices.some((d: any) => /17e|Hub/.test(d.name)) && !S!.nodes.some((n) => n.host && n.itemsSession > 0), flog.devices.map((d: any) => d.name).join(', '));
+    const rcsv = fs.readFileSync(out('render.csv'), 'utf8').trim().split(/\r?\n/);
+    const ccsv = fs.existsSync(out('captions.csv')) ? fs.readFileSync(out('captions.csv'), 'utf8').trim().split(/\r?\n/) : [];
+    const png = fs.readFileSync(out('render.png'));
+    report('Film zip has render.csv, captions.csv, fleet.csv, render.png', rcsv[0] === 'devices,seconds' && rcsv.length === 3 && ccsv[0]?.includes('latency_s') && fs.existsSync(out('fleet.csv')) && png.toString('latin1', 1, 4) === 'PNG', `${flog.zip.join(', ')}`);
+    report('Film mode page had no errors', errs.length === 0, errs.slice(0, 3).join(' | ') || 'none');
+    fs.mkdirSync('scripts/tmp', { recursive: true });
+    await page.screenshot({ path: 'scripts/tmp/film-done.png' });
+    fs.rmSync(dir, { recursive: true, force: true });
+    await ctx.close();
+    cmd({ cmd: 'node', nodeId: '*', action: 'resume' });
+  }
+
   if (ONLY.has('console')) {
     const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1920, height: 1080 } });
     const page = await ctx.newPage();
